@@ -129,9 +129,15 @@ class PBTApp:
 
         return result
 
-    def run(self, target: Optional[str] = None, full_refresh: bool = False):
+    def run(self, target: Optional[str] = None, full_refresh: bool = False, debug: bool = False):
         """Execute models in dependency order"""
         execution_order = self.topological_sort()
+
+        if debug:
+            print(f"\n[DEBUG] Execution order: {' -> '.join(execution_order)}")
+            print(f"[DEBUG] Full refresh: {full_refresh}")
+            if target:
+                print(f"[DEBUG] Target model: {target}")
 
         if target:
             # Only run target and its dependencies
@@ -160,6 +166,17 @@ class PBTApp:
                         }
                     kwargs[param_name] = df
 
+            if debug:
+                deps = list(kwargs.keys())
+                print(f"\n[DEBUG] {model_name}:")
+                print(f"  - Type: {model_type}")
+                print(f"  - Dependencies: {deps if deps else 'none'}")
+                if config.get("incremental"):
+                    print(f"  - Incremental: True (time_column={config.get('time_column')})")
+                    state = self.state_manager.get_state(model_name)
+                    if state:
+                        print(f"  - Last max value: {state.get('last_max_value', 'N/A')}")
+
             # Execute model
             print(f"Running {model_name} ({model_type})...")
             result = func(**kwargs)
@@ -172,13 +189,19 @@ class PBTApp:
 
                 collected = result.collect()
 
+                if debug:
+                    print(f"  - Collected {len(collected)} rows")
+
                 # Handle incremental append
                 if config.get("incremental"):
                     if output_path.exists() and not full_refresh:
                         # Read existing data and append new records
                         existing = pl.read_parquet(output_path)
+                        new_rows = len(collected)
                         collected = pl.concat([existing, collected])
-                        print(f"  -> Appended {len(result.collect())} new rows to {output_path}")
+                        if debug:
+                            print(f"  - Existing rows: {len(existing)}, New rows: {new_rows}, Total: {len(collected)}")
+                        print(f"  -> Appended {new_rows} new rows to {output_path}")
                     else:
                         print(f"  -> Wrote {output_path} (initial load)")
                 else:
@@ -195,6 +218,8 @@ class PBTApp:
                         "last_max_value": str(max_value),
                         "last_run": str(Path.cwd())  # TODO: proper timestamp
                     })
+                    if debug:
+                        print(f"  - Updated state: last_max_value={max_value}")
 
     def _get_downstream(self, model: str) -> set[str]:
         """Get all models that depend on this model"""
@@ -209,6 +234,27 @@ class PBTApp:
 
         visit(model)
         return downstream
+
+    def read_table(self, table_name: str) -> pl.DataFrame:
+        """Read a materialized table from disk"""
+        if table_name not in self.models:
+            raise ValueError(f"Model '{table_name}' not found. Available: {list(self.models.keys())}")
+
+        model_type = self.models[table_name]["type"]
+        if model_type != "table":
+            raise ValueError(f"'{table_name}' is a {model_type}, not a table. Use read_table() only for materialized tables.")
+
+        output_path = self.root / "output" / f"{table_name}.parquet"
+        if not output_path.exists():
+            raise FileNotFoundError(f"Table '{table_name}' has not been materialized yet. Run app.run() first.")
+
+        return pl.read_parquet(output_path)
+
+    def get_model(self, model_name: str) -> Dict[str, Any]:
+        """Get model metadata and function"""
+        if model_name not in self.models:
+            raise ValueError(f"Model '{model_name}' not found. Available: {list(self.models.keys())}")
+        return self.models[model_name]
 
 
 def conf(root: str | Path = ".", env: str = "dev") -> PBTApp:

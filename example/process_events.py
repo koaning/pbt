@@ -88,64 +88,16 @@ def daily_stats(cleaned_events):
         .sort('date')
     )
 
-
-def print_table(title: str, table_name: str, output_dir: Path, n_rows: int = 10):
-    """Load and print a table if it exists"""
-    path = output_dir / f"{table_name}.parquet"
-    if not path.exists():
-        return None
-
-    df = pl.read_parquet(path)
-    print("\n" + "-" * 60)
-    print(title)
-    print("-" * 60)
-    print(df.head(n_rows))
-    return df
-
-
-def print_analysis():
-    """Print analysis from materialized tables"""
-    output_dir = Path(__file__).parent / "output"
-
-    print("\n" + "=" * 60)
-    print("ANALYSIS FROM MATERIALIZED TABLES")
-    print("=" * 60)
-
-    # Print all tables
-    events_df = print_table("EVENTS", "events", output_dir)
-    print_table("USER SUMMARY", "user_summary", output_dir)
-    print_table("DAILY STATISTICS", "daily_stats", output_dir)
-
-    # Conversion funnel from events
-    if events_df is not None and len(events_df) > 0:
-        total_users = events_df.select(pl.col('user').n_unique()).item()
-
-        print("\n" + "-" * 60)
-        print("CONVERSION FUNNEL")
-        print("-" * 60)
-        print(f"total_users: {total_users}")
-
-        for event, metric_name in [
-            ('login', 'login_rate'),
-            ('page_view', 'page_view_rate'),
-            ('click_button', 'click_rate'),
-            ('purchase', 'conversion_rate')
-        ]:
-            count = events_df.filter(pl.col('event') == event).select(pl.col('user').n_unique()).item()
-            print(f"{metric_name}: {count / total_users:.2%}")
-
-
 if __name__ == "__main__":
-    print("=" * 60)
-    print("PBT EVENT PROCESSING PIPELINE")
-    print("=" * 60)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Process user events with PBT")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--full-refresh", action="store_true", help="Force full refresh of all tables")
+    args = parser.parse_args()
 
     # Run the PBT pipeline
-    app.run()
+    app.run(debug=args.debug, full_refresh=args.full_refresh)
+    events_df = app.read_table("events")
+    print(events_df.tail())
 
-    # Print analysis
-    print_analysis()
-
-    print("\n" + "=" * 60)
-    print("Pipeline complete!")
-    print("=" * 60)
