@@ -98,6 +98,23 @@ if __name__ == "__main__":
 
     # Run the PBT pipeline
     app.run(debug=args.debug, full_refresh=args.full_refresh)
-    events_df = app.read_table("events")
+
+    print("\n" + "=" * 60)
+    print("DEMO: Model API")
+    print("=" * 60)
+
+    # Use .build() to read materialized table (eager)
+    print("\nEvents table (using events.build()):")
+    events_df = events.build()
     print(events_df.tail())
+
+    # Use .lazy() to get lazy scan
+    print("\nUser summary (using user_summary.lazy() for lazy scan):")
+    user_summary_lf = user_summary.lazy()
+    print(user_summary_lf.collect())
+
+    # Can also use models as functions
+    print("\nUsing cleaned_events() as a function:")
+    result = cleaned_events(raw_events())
+    print(f"Type: {type(result)}, Can collect: {hasattr(result, 'collect')}")
 

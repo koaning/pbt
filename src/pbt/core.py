@@ -10,6 +10,59 @@ import polars as pl
 from pbt.state import StateManager
 
 
+class Model:
+    """Wrapper for PBT models that can be called as functions or accessed via .build()/.lazy()"""
+
+    def __init__(self, func: Callable, app: "PBTApp", model_type: str, config: dict):
+        self.func = func
+        self.app = app
+        self.name = func.__name__
+        self.model_type = model_type
+        self.config = config
+        # Preserve function metadata
+        self.__name__ = func.__name__
+        self.__doc__ = func.__doc__
+
+    def __call__(self, *args, **kwargs):
+        """Use as normal function"""
+        return self.func(*args, **kwargs)
+
+    def build(self) -> pl.DataFrame:
+        """
+        Execute and return result as eager DataFrame.
+        For tables: Read materialized parquet
+        For models/sources: Execute dependency chain and return result
+        """
+        if self.model_type == "table":
+            return self.app.read_table(self.name)
+        else:
+            # Execute just this model and its dependencies
+            cache = self.app.run(target=self.name, silent=True)
+            result = cache.get(self.name)
+            if result is None:
+                raise RuntimeError(f"Model '{self.name}' was not executed successfully")
+            # Collect if lazy
+            if hasattr(result, 'collect'):
+                return result.collect()
+            return result
+
+    def lazy(self) -> pl.LazyFrame:
+        """
+        Lazy scan of materialized table - only works for tables.
+        """
+        if self.model_type != "table":
+            raise ValueError(
+                f"'{self.name}' is a {self.model_type}, not a table. "
+                "Only materialized tables can be scanned lazily."
+            )
+        output_path = self.app.root / "output" / f"{self.name}.parquet"
+        if not output_path.exists():
+            raise FileNotFoundError(
+                f"Table '{self.name}' has not been materialized yet. Run app.run() first."
+            )
+        return pl.scan_parquet(output_path)
+
+
 class PBTApp:
     """Main PBT application that manages models and execution"""
 
@@ -19,38 +72,25 @@ class PBTApp:
         self.models: Dict[str, Dict[str, Any]] = {}
         self.state_manager = StateManager(self.root / ".pbt" / "state.json")
 
-    def source(self, func: Callable) -> Callable:
+    def source(self, func: Callable) -> Model:
         """Decorator for source tables - always recomputed"""
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            result = func(*args, **kwargs)
-            # Inject metadata
-            if hasattr(result, '_pbt_metadata'):
-                result._pbt_metadata = {"source": func.__name__, "type": "source"}
-            return result
-
+        model = Model(func, self, "source", {})
         self.models[func.__name__] = {
-            "func": wrapper,
+            "func": model,
             "type": "source",
             "config": {}
         }
-        return wrapper
+        return model
 
-    def model(self, func: Callable) -> Callable:
+    def model(self, func: Callable) -> Model:
         """Decorator for view models - lazy evaluation, not materialized"""
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            result = func(*args, **kwargs)
-            if hasattr(result, '_pbt_metadata'):
-                result._pbt_metadata = {"source": func.__name__, "type": "model"}
-            return result
-
+        model = Model(func, self, "model", {})
         self.models[func.__name__] = {
-            "func": wrapper,
+            "func": model,
             "type": "model",
             "config": {}
         }
-        return wrapper
+        return model
 
     def table(
         self,
@@ -60,33 +100,22 @@ class PBTApp:
         time_column: Optional[str] = None,
         unique_key: Optional[str | list[str]] = None,
         partition_by: Optional[str] = None
-    ) -> Callable:
+    ) -> Model:
         """Decorator for materialized tables - writes to parquet"""
-        def decorator(f: Callable) -> Callable:
-            @wraps(f)
-            def wrapper(*args, **kwargs):
-                result = f(*args, **kwargs)
-                if hasattr(result, '_pbt_metadata'):
-                    result._pbt_metadata = {
-                        "source": f.__name__,
-                        "type": "table",
-                        "target_table": f.__name__,
-                        "state_manager": self.state_manager,
-                        "full_refresh": False  # TODO: add CLI flag
-                    }
-                return result
-
-            self.models[f.__name__] = {
-                "func": wrapper,
-                "type": "table",
-                "config": {
-                    "incremental": incremental,
-                    "time_column": time_column,
-                    "unique_key": unique_key,
-                    "partition_by": partition_by
-                }
+        def decorator(f: Callable) -> Model:
+            config = {
+                "incremental": incremental,
+                "time_column": time_column,
+                "unique_key": unique_key,
+                "partition_by": partition_by
             }
-            return wrapper
+            model = Model(f, self, "table", config)
+            self.models[f.__name__] = {
+                "func": model,
+                "type": "table",
+                "config": config
+            }
+            return model
 
         # Support both @app.table and @app.table(incremental=True)
         if func is None:
@@ -129,11 +158,11 @@ class PBTApp:
 
         return result
 
-    def run(self, target: Optional[str] = None, full_refresh: bool = False, debug: bool = False):
-        """Execute models in dependency order"""
+    def run(self, target: Optional[str] = None, full_refresh: bool = False, debug: bool = False, silent: bool = False) -> Dict[str, Any]:
+        """Execute models in dependency order and return execution cache"""
         execution_order = self.topological_sort()
 
-        if debug:
+        if debug and not silent:
             print(f"\n[DEBUG] Execution order: {' -> '.join(execution_order)}")
             print(f"[DEBUG] Full refresh: {full_refresh}")
             if target:
@@ -147,9 +176,12 @@ class PBTApp:
 
         for model_name in execution_order:
             model_info = self.models[model_name]
-            func = model_info["func"]
+            model_obj = model_info["func"]  # This is a Model instance
             model_type = model_info["type"]
             config = model_info["config"]
+
+            # Get the actual function from the Model wrapper
+            func = model_obj.func if isinstance(model_obj, Model) else model_obj
 
             # Prepare arguments by name matching
             sig = inspect.signature(func)
@@ -166,7 +198,7 @@ class PBTApp:
                         }
                     kwargs[param_name] = df
 
-            if debug:
+            if debug and not silent:
                 deps = list(kwargs.keys())
                 print(f"\n[DEBUG] {model_name}:")
                 print(f"  - Type: {model_type}")
@@ -178,7 +210,8 @@ class PBTApp:
                         print(f"  - Last max value: {state.get('last_max_value', 'N/A')}")
 
             # Execute model
-            print(f"Running {model_name} ({model_type})...")
+            if not silent:
+                print(f"Running {model_name} ({model_type})...")
             result = func(**kwargs)
             cache[model_name] = result
 
@@ -189,7 +222,7 @@ class PBTApp:
 
                 collected = result.collect()
 
-                if debug:
+                if debug and not silent:
                     print(f"  - Collected {len(collected)} rows")
 
                 # Handle incremental append
@@ -199,13 +232,16 @@ class PBTApp:
                         existing = pl.read_parquet(output_path)
                         new_rows = len(collected)
                         collected = pl.concat([existing, collected])
-                        if debug:
+                        if debug and not silent:
                             print(f"  - Existing rows: {len(existing)}, New rows: {new_rows}, Total: {len(collected)}")
-                        print(f"  -> Appended {new_rows} new rows to {output_path}")
+                        if not silent:
+                            print(f"  -> Appended {new_rows} new rows to {output_path}")
                     else:
-                        print(f"  -> Wrote {output_path} (initial load)")
+                        if not silent:
+                            print(f"  -> Wrote {output_path} (initial load)")
                 else:
-                    print(f"  -> Wrote {output_path}")
+                    if not silent:
+                        print(f"  -> Wrote {output_path}")
 
                 # Write combined data
                 collected.write_parquet(output_path)
@@ -218,8 +254,10 @@ class PBTApp:
                         "last_max_value": str(max_value),
                         "last_run": str(Path.cwd())  # TODO: proper timestamp
                     })
-                    if debug:
+                    if debug and not silent:
                         print(f"  - Updated state: last_max_value={max_value}")
+
+        return cache
 
     def _get_downstream(self, model: str) -> set[str]:
         """Get all models that depend on this model"""
