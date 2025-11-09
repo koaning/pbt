@@ -2,62 +2,6 @@
 
 A DBT-like data transformation tool built on Polars/Narwhals with lazy evaluation and incremental processing.
 
-## Installation
-
-### Prerequisites
-
-First, install [uv](https://docs.astral.sh/uv/) if you haven't already:
-
-```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Or via pip
-pip install uv
-```
-
-### Setup
-
-Clone the repository and set up the virtual environment:
-
-```bash
-# Clone the repo
-git clone <repository-url>
-cd pbt
-
-# Create/sync virtual environment (works with existing or new venvs)
-uv venv
-uv sync
-```
-
-The `uv venv` command will create a new virtual environment or use an existing one if it's already present. The `uv sync` command installs all dependencies specified in `pyproject.toml`.
-
-### Verify Installation
-
-```bash
-# Activate the virtual environment
-source .venv/bin/activate  # On macOS/Linux
-# or
-.venv\Scripts\activate     # On Windows
-
-# Run the example
-python example.py
-
-# Or run directly with uv (no activation needed)
-uv run python example.py
-```
-
-## Features
-
-- **Decorator-based model definition** - `@app.source`, `@app.model`, `@app.table`
-- **Automatic dependency resolution** - DAG built from function parameters
-- **Incremental processing** - Track state and process only new records
-- **Lazy evaluation** - All models use Polars LazyFrames for efficiency
-- **Simple materialization** - Tables write to parquet automatically
-
 ## Quick Start
 
 ```python
