@@ -62,3 +62,4 @@ make test
 - Lock file is `uv.lock` (committed to repo)
 - Virtual environment is `.venv/` (gitignored)
 - Generated data files go in `data/` (gitignored)
+- **Use Polars, not Pandas** - All data manipulation uses `polars` for performance and consistency
