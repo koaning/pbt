@@ -73,25 +73,6 @@ def events(raw_data):
     )
 ```
 
-### How it works:
-
-1. **First run**: Processes all data, saves max value of `time_column`
-2. **Subsequent runs**:
-   - `.incremental_filter()` automatically adds `WHERE col > last_max_value`
-   - New records are appended to existing parquet file
-   - State is updated with new max value
-
-State is stored in `{root}/.pbt/state.json`:
-
-```json
-{
-  "events": {
-    "last_max_value": "2025-11-05 23:00:00",
-    "last_run": "..."
-  }
-}
-```
-
 ## Dependency Resolution
 
 PBT builds a DAG by inspecting function parameters:
