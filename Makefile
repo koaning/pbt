@@ -7,9 +7,11 @@ help:
 
 install:
 	@echo "Setting up virtual environment..."
-	uv venv
+	uv venv --allow-existing
 	@echo "Installing dependencies..."
-	uv sync
+	uv sync --extra dev
+	@echo "Installing pre-commit hooks..."
+	uv run pre-commit install
 	@echo "Installation complete!"
 
 clean:
