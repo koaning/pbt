@@ -108,13 +108,8 @@ if __name__ == "__main__":
     events_df = events.build()
     print(events_df.tail())
 
-    # Use .lazy() to get lazy scan
-    print("\nUser summary (using user_summary.lazy() for lazy scan):")
-    user_summary_lf = user_summary.lazy()
+    # Use .build_lazy() to get lazy scan
+    print("\nUser summary (using user_summary.build_lazy() for lazy scan):")
+    user_summary_lf = user_summary.build_lazy()
     print(user_summary_lf.collect())
-
-    # Can also use models as functions
-    print("\nUsing cleaned_events() as a function:")
-    result = cleaned_events(raw_events())
-    print(f"Type: {type(result)}, Can collect: {hasattr(result, 'collect')}")
 

@@ -46,7 +46,7 @@ class Model:
                 return result.collect()
             return result
 
-    def lazy(self) -> pl.LazyFrame:
+    def build_lazy(self) -> pl.LazyFrame:
         """
         Lazy scan of materialized table - only works for tables.
         """
