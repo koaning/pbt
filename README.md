@@ -1,4 +1,4 @@
-# PBT - Polars-Based Transformations
+# PBT
 
 A DBT-like data transformation tool built on Polars/Narwhals with lazy evaluation and incremental processing.
 
