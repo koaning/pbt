@@ -20,12 +20,11 @@ def cleaned_logs(raw_logs):
     """Models are views - lazy evaluation, not materialized"""
     return raw_logs.filter(pl.col("event").is_not_null())
 
-@app.table(incremental=True, time_column="timestamp")
+@app.incremental_table(time_column="timestamp")
 def user_events(cleaned_logs):
     """Tables are materialized to parquet"""
     return (
         cleaned_logs
-        .incremental_filter("timestamp")  # Only new records
         .select(["user_id", "event", "timestamp"])
     )
 
@@ -56,22 +55,24 @@ app.run()
 
 ### `@app.table`
 - Materialized to parquet files in `{root}/output/`
-- Supports incremental processing
 - Supports full refresh mode
+
+### `@app.incremental_table`
+- Sets up append-only incremental tables
+- Automatically filters to new records using `time_column`
+- Still materializes to `{root}/output/`
 
 ## Incremental Processing
 
 Incremental tables track the maximum value of a time column and only process new records:
 
 ```python
-@app.table(incremental=True, time_column="created_at")
+@app.incremental_table(time_column="created_at")
 def events(raw_data):
-    return (
-        raw_data
-        .incremental_filter("created_at")  # Filters where created_at > last_max
-        .select(...)
-    )
+    return raw_data.select(...)
 ```
+
+For advanced use cases you can still call `.incremental_filter()` manually (e.g. to place the filter earlier in your pipeline or combine with other predicates). The helper just saves you from repeating the time column in both places.
 
 ## Dependency Resolution
 
@@ -112,6 +113,10 @@ The `.incremental_filter()` method reads this metadata to:
 - Know which table is being built
 - Access the state manager
 - Get the last max value for filtering
+
+### State Tracking
+
+Every table write updates `{root}/.pbt/state.json` with a `last_run` timestamp, and incremental tables also track their `last_max_value`. This makes it easy to audit when each table was materialized and where incremental processing will resume.
 
 ## Running
 

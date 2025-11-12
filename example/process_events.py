@@ -5,7 +5,7 @@ This example demonstrates:
 - @app.source for raw data ingestion
 - @app.model for intermediate transformations
 - @app.table for materialized outputs
-- Incremental processing with .incremental_filter()
+- Incremental processing with @app.incremental_table
 """
 
 import polars as pl
@@ -40,7 +40,7 @@ def cleaned_events(raw_events):
     )
 
 
-@app.table(incremental=True, time_column="timestamp")
+@app.incremental_table(time_column="timestamp")
 def events(cleaned_events):
     """
     Materialized events table with incremental processing.
@@ -49,7 +49,6 @@ def events(cleaned_events):
     """
     return (
         cleaned_events
-        .incremental_filter("timestamp")
         .select(['user', 'event', 'timestamp'])
     )
 
@@ -112,4 +111,3 @@ if __name__ == "__main__":
     print("\nUser summary (using user_summary.build_lazy() for lazy scan):")
     user_summary_lf = user_summary.build_lazy()
     print(user_summary_lf.collect())
-

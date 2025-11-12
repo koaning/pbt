@@ -62,14 +62,14 @@ dependencies = [p for p in sig.parameters if p in app.models]
 **Current implementation**: Simple append based on time column
 
 ```python
-@app.table(incremental=True, time_column="timestamp")
+@app.incremental_table(time_column="timestamp")
 def events(raw_logs):
-    return raw_logs.incremental_filter("timestamp").select(...)
+    return raw_logs.select(...)
 ```
 
 **Flow**:
 1. Read state: `last_max_value = "2025-11-05 23:00:00"`
-2. Filter: `WHERE timestamp > '2025-11-05 23:00:00'`
+2. Automatically filter: `WHERE timestamp > '2025-11-05 23:00:00'`
 3. Collect new records
 4. Append to existing parquet
 5. Update state with new max value
@@ -91,11 +91,16 @@ def events(raw_logs):
 ```json
 {
   "model_name": {
-    "last_max_value": "2025-11-05 23:00:00",
-    "last_run": "/path/to/project"
+    "last_run": "2025-11-05T23:15:42.123456"
+  },
+  "incremental_model": {
+    "last_run": "2025-11-05T23:15:42.123456",
+    "last_max_value": "2025-11-05 23:00:00"
   }
 }
 ```
+
+Each materialized table records at least a `last_run` UTC timestamp. Incremental tables store an additional `last_max_value` watermark for their configured time column.
 
 **Why JSON?**
 - ✅ Human-readable

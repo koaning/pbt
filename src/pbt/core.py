@@ -1,6 +1,7 @@
 """Core PBT functionality: conf, decorators, and execution"""
 
 import inspect
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -122,6 +123,34 @@ class PBTApp:
             return decorator
         else:
             return decorator(func)
+
+    def incremental_table(
+        self,
+        *,
+        time_column: str,
+        unique_key: Optional[str | list[str]] = None,
+        partition_by: Optional[str] = None
+    ) -> Model:
+        """Sugar for incremental tables that auto-applies incremental_filter"""
+        def decorator(func: Callable) -> Model:
+            base_decorator = self.table(
+                incremental=True,
+                time_column=time_column,
+                unique_key=unique_key,
+                partition_by=partition_by
+            )
+
+            @wraps(func)
+            def wrapped(*args, **kwargs):
+                result = func(*args, **kwargs)
+                # Automatically filter for new records if supported
+                if hasattr(result, "incremental_filter"):
+                    return result.incremental_filter(time_column)
+                return result
+
+            return base_decorator(wrapped)
+
+        return decorator
 
     def get_dependencies(self, func: Callable) -> list[str]:
         """Extract model dependencies from function parameters"""
@@ -246,16 +275,16 @@ class PBTApp:
                 # Write combined data
                 collected.write_parquet(output_path)
 
-                # Update state if incremental
+                # Update state metadata for observability
+                state_payload = {"last_run": datetime.utcnow().isoformat()}
                 if config.get("incremental") and config.get("time_column"):
                     time_col = config["time_column"]
                     max_value = collected.select(time_col).max().item()
-                    self.state_manager.update_state(model_name, {
-                        "last_max_value": str(max_value),
-                        "last_run": str(Path.cwd())  # TODO: proper timestamp
-                    })
-                    if debug and not silent:
-                        print(f"  - Updated state: last_max_value={max_value}")
+                    state_payload["last_max_value"] = str(max_value)
+                self.state_manager.update_state(model_name, state_payload)
+                if debug and not silent:
+                    meta_msg = ", ".join(f"{k}={v}" for k, v in state_payload.items())
+                    print(f"  - Updated state: {meta_msg}")
 
         return cache
 

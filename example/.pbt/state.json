@@ -1,6 +1,12 @@
 {
   "events": {
     "last_max_value": "2025-01-15 20:18:56",
-    "last_run": "/Users/vincentwarmerdam/Development/pbt/.conductor/harrisburg"
+    "last_run": "2025-11-12T21:32:45.550266"
+  },
+  "user_summary": {
+    "last_run": "2025-11-12T21:32:45.562329"
+  },
+  "daily_stats": {
+    "last_run": "2025-11-12T21:32:45.566116"
   }
 }
