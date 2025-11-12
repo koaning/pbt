@@ -6,11 +6,13 @@ This example demonstrates:
 - @app.model for intermediate transformations
 - @app.table for materialized outputs
 - Incremental processing with @app.incremental_table
+- Targeted reruns via Model.rerun()
 """
 
 import polars as pl
 from pathlib import Path
 import sys
+from datetime import datetime
 
 # Add parent directory to path to import pbt
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -111,3 +113,14 @@ if __name__ == "__main__":
     print("\nUser summary (using user_summary.build_lazy() for lazy scan):")
     user_summary_lf = user_summary.build_lazy()
     print(user_summary_lf.collect())
+
+    rerun_start = datetime(2025, 1, 15, 18, 0, 0)
+    rerun_end = datetime(2025, 1, 15, 19, 0, 0)
+    print(f"\nRe-running events between {rerun_start} and {rerun_end}:")
+    rerun_df = events.rerun(rerun_start, rerun_end, debug=args.debug, silent=True)
+    print(
+        rerun_df.filter(
+            (pl.col('timestamp') >= rerun_start) &
+            (pl.col('timestamp') <= rerun_end)
+        )
+    )

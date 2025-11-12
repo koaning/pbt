@@ -74,6 +74,17 @@ def events(raw_data):
 
 For advanced use cases you can still call `.incremental_filter()` manually (e.g. to place the filter earlier in your pipeline or combine with other predicates). The helper just saves you from repeating the time column in both places.
 
+### Rerunning specific windows
+
+Incremental tables expose `.rerun(min_date, max_date)` so you can reprocess historical ranges without doing a full refresh. PBT removes the old rows for that window from the materialized parquet and rebuilds them using the current logic—handy for backfills or bug fixes.
+
+```python
+# Backfill everything that happened between noon and 6PM
+user_events.rerun("2025-01-15T12:00:00", "2025-01-15T18:00:00")
+```
+
+The helper accepts Python `datetime` objects or ISO-8601 strings and is only available on incremental tables with a configured `time_column`.
+
 ## Dependency Resolution
 
 PBT builds a DAG by inspecting function parameters:
@@ -105,14 +116,15 @@ PBT monkeypatches `pl.LazyFrame` to add `._pbt_metadata`:
 df._pbt_metadata = {
     "target_table": "user_events",
     "state_manager": <StateManager>,
-    "full_refresh": False
+    "full_refresh": False,
+    "reprocess_range": ("2025-01-15T12:00:00", "2025-01-15T18:00:00")  # Optional rerun override
 }
 ```
 
 The `.incremental_filter()` method reads this metadata to:
 - Know which table is being built
 - Access the state manager
-- Get the last max value for filtering
+- Get the last max value (or rerun bounds) for filtering
 
 ### State Tracking
 

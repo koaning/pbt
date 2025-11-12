@@ -17,12 +17,17 @@ PBT (Polars-Based Transformations) is a lightweight alternative to DBT that work
 dataframe._pbt_metadata = {
     "target_table": "user_events",
     "state_manager": <StateManager instance>,
-    "full_refresh": False
+    "full_refresh": False,
+    "reprocess_range": ("2025-01-15T12:00:00", "2025-01-15T18:00:00")  # optional override
 }
 
 # Then .incremental_filter() reads this
 def incremental_filter(self, column):
     meta = self._pbt_metadata
+    rerun_range = meta.get("reprocess_range")
+    if rerun_range:
+        start, end = rerun_range
+        return self.filter(pl.col(column).is_between(start, end, closed="both"))
     last_val = meta["state_manager"].get_state(meta["target_table"])["last_max_value"]
     return self.filter(pl.col(column) > last_val)
 ```
@@ -123,6 +128,8 @@ if incremental and file_exists and not full_refresh:
 collected.write_parquet(file)
 ```
 
+When `reprocess_range` is set (via `Model.rerun()`), existing rows within that window are removed before concatenation and the combined result is resorted on the incremental column.
+
 **Why parquet?**
 - ✅ Columnar format, efficient for analytics
 - ✅ Native Polars support
@@ -154,6 +161,14 @@ collected.write_parquet(file)
 - **No built-in testing**: Users must write their own checks
 - **No packages/hub**: DBT has extensive ecosystem
 - **Early stage**: Missing many DBT features (snapshots, seeds, docs)
+
+### Rerun / Backfill Windows
+
+- `Model.rerun(min_date, max_date)` registers a temporary `reprocess_range` on the target table.
+- Bounds must be ISO-8601 strings or `datetime` objects so we can compare and remove the matching window from existing parquet files.
+- Dependencies receive this metadata so `.incremental_filter()` narrows to the explicit bounds instead of `last_max_value`.
+- During materialization we drop rows from the historical window, insert the recomputed slice, and resort on the time column to keep chronological order.
+- State tracking continues to store the overall `last_max_value` along with the latest `last_run` timestamp.
 
 ## Future Enhancements
 
