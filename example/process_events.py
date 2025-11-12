@@ -5,12 +5,14 @@ This example demonstrates:
 - @app.source for raw data ingestion
 - @app.model for intermediate transformations
 - @app.table for materialized outputs
-- Incremental processing with .incremental_filter()
+- Incremental processing with @app.incremental_table
+- Targeted reruns via Model.rerun()
 """
 
 import polars as pl
 from pathlib import Path
 import sys
+from datetime import datetime
 
 # Add parent directory to path to import pbt
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -40,7 +42,7 @@ def cleaned_events(raw_events):
     )
 
 
-@app.table(incremental=True, time_column="timestamp")
+@app.incremental_table(time_column="timestamp")
 def events(cleaned_events):
     """
     Materialized events table with incremental processing.
@@ -49,7 +51,6 @@ def events(cleaned_events):
     """
     return (
         cleaned_events
-        .incremental_filter("timestamp")
         .select(['user', 'event', 'timestamp'])
     )
 
@@ -113,3 +114,13 @@ if __name__ == "__main__":
     user_summary_lf = user_summary.build_lazy()
     print(user_summary_lf.collect())
 
+    rerun_start = datetime(2025, 1, 15, 18, 0, 0)
+    rerun_end = datetime(2025, 1, 15, 19, 0, 0)
+    print(f"\nRe-running events between {rerun_start} and {rerun_end}:")
+    rerun_df = events.rerun(rerun_start, rerun_end, debug=args.debug, silent=True)
+    print(
+        rerun_df.filter(
+            (pl.col('timestamp') >= rerun_start) &
+            (pl.col('timestamp') <= rerun_end)
+        )
+    )

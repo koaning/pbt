@@ -1,13 +1,15 @@
 """Core PBT functionality: conf, decorators, and execution"""
 
 import inspect
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import polars as pl
 
 from pbt.state import StateManager
+from pbt.utils import coerce_datetime, parse_timestamp_value
 
 
 class Model:
@@ -62,6 +64,19 @@ class Model:
             )
         return pl.scan_parquet(output_path)
 
+    def rerun(
+        self,
+        min_date: datetime | str,
+        max_date: datetime | str,
+        *,
+        debug: bool = False,
+        silent: bool = False
+    ) -> pl.DataFrame:
+        """Reprocess a specific time window for incremental tables."""
+        if self.model_type != "table":
+            raise ValueError("Only materialized tables support rerun()")
+        return self.app.rerun_table(self.name, min_date, max_date, debug=debug, silent=silent)
+
 
 class PBTApp:
     """Main PBT application that manages models and execution"""
@@ -71,6 +86,7 @@ class PBTApp:
         self.env = env
         self.models: Dict[str, Dict[str, Any]] = {}
         self.state_manager = StateManager(self.root / ".pbt" / "state.json")
+        self._rerun_ranges: Dict[str, Tuple[str, str]] = {}
 
     def source(self, func: Callable) -> Model:
         """Decorator for source tables - always recomputed"""
@@ -123,9 +139,75 @@ class PBTApp:
         else:
             return decorator(func)
 
+    def incremental_table(
+        self,
+        *,
+        time_column: str,
+        unique_key: Optional[str | list[str]] = None,
+        partition_by: Optional[str] = None
+    ) -> Model:
+        """Sugar for incremental tables that auto-applies incremental_filter"""
+        def decorator(func: Callable) -> Model:
+            base_decorator = self.table(
+                incremental=True,
+                time_column=time_column,
+                unique_key=unique_key,
+                partition_by=partition_by
+            )
+
+            @wraps(func)
+            def wrapped(*args, **kwargs):
+                result = func(*args, **kwargs)
+                # Automatically filter for new records if supported
+                if hasattr(result, "incremental_filter"):
+                    return result.incremental_filter(time_column)
+                return result
+
+            return base_decorator(wrapped)
+
+        return decorator
+
+    def rerun_table(
+        self,
+        table_name: str,
+        min_date: datetime | str,
+        max_date: datetime | str,
+        *,
+        debug: bool = False,
+        silent: bool = False
+    ) -> pl.DataFrame:
+        """Reprocess a specific window for an incremental table."""
+        model_info = self.get_model(table_name)
+        config = model_info["config"]
+
+        if model_info["type"] != "table":
+            raise ValueError(f"'{table_name}' is not a table")
+        if not config.get("incremental") or not config.get("time_column"):
+            raise ValueError("rerun() is only available for incremental tables with a time_column")
+
+        start_dt = coerce_datetime(min_date, "min_date")
+        end_dt = coerce_datetime(max_date, "max_date")
+        if end_dt < start_dt:
+            raise ValueError("max_date must be greater than or equal to min_date")
+
+        start_iso = start_dt.isoformat()
+        end_iso = end_dt.isoformat()
+        self._rerun_ranges[table_name] = (start_iso, end_iso)
+
+        try:
+            self.run(target=table_name, debug=debug, silent=silent)
+        finally:
+            self._rerun_ranges.pop(table_name, None)
+
+        return self.read_table(table_name)
+
     def get_dependencies(self, func: Callable) -> list[str]:
         """Extract model dependencies from function parameters"""
-        sig = inspect.signature(func)
+        if isinstance(func, Model):
+            target = func.func
+        else:
+            target = func
+        sig = inspect.signature(target)
         return [
             param.name for param in sig.parameters.values()
             if param.name in self.models
@@ -169,8 +251,8 @@ class PBTApp:
                 print(f"[DEBUG] Target model: {target}")
 
         if target:
-            # Only run target and its dependencies
-            execution_order = [m for m in execution_order if m == target or target in self._get_downstream(m)]
+            needed = self._get_ancestors(target) | {target}
+            execution_order = [m for m in execution_order if m in needed]
 
         cache = {}
 
@@ -194,7 +276,8 @@ class PBTApp:
                         df._pbt_metadata = {
                             "target_table": model_name,
                             "state_manager": self.state_manager,
-                            "full_refresh": full_refresh
+                            "full_refresh": full_refresh,
+                            "reprocess_range": self._rerun_ranges.get(model_name)
                         }
                     kwargs[param_name] = df
 
@@ -225,17 +308,36 @@ class PBTApp:
                 if debug and not silent:
                     print(f"  - Collected {len(collected)} rows")
 
+                reprocess_range = self._rerun_ranges.get(model_name)
+
                 # Handle incremental append
                 if config.get("incremental"):
                     if output_path.exists() and not full_refresh:
                         # Read existing data and append new records
                         existing = pl.read_parquet(output_path)
                         new_rows = len(collected)
+
+                        if reprocess_range and config.get("time_column"):
+                            start_value, end_value = reprocess_range
+                            start_literal = pl.lit(parse_timestamp_value(start_value))
+                            end_literal = pl.lit(parse_timestamp_value(end_value))
+                            existing = existing.filter(
+                                (pl.col(config["time_column"]) < start_literal) |
+                                (pl.col(config["time_column"]) > end_literal)
+                            )
+
                         collected = pl.concat([existing, collected])
+
+                        if reprocess_range and config.get("time_column"):
+                            collected = collected.sort(config["time_column"])
+
                         if debug and not silent:
                             print(f"  - Existing rows: {len(existing)}, New rows: {new_rows}, Total: {len(collected)}")
                         if not silent:
-                            print(f"  -> Appended {new_rows} new rows to {output_path}")
+                            if reprocess_range:
+                                print(f"  -> Reprocessed {new_rows} rows for window {reprocess_range} in {output_path}")
+                            else:
+                                print(f"  -> Appended {new_rows} new rows to {output_path}")
                     else:
                         if not silent:
                             print(f"  -> Wrote {output_path} (initial load)")
@@ -246,32 +348,32 @@ class PBTApp:
                 # Write combined data
                 collected.write_parquet(output_path)
 
-                # Update state if incremental
+                # Update state metadata for observability
+                state_payload = {"last_run": datetime.utcnow().isoformat()}
                 if config.get("incremental") and config.get("time_column"):
                     time_col = config["time_column"]
                     max_value = collected.select(time_col).max().item()
-                    self.state_manager.update_state(model_name, {
-                        "last_max_value": str(max_value),
-                        "last_run": str(Path.cwd())  # TODO: proper timestamp
-                    })
-                    if debug and not silent:
-                        print(f"  - Updated state: last_max_value={max_value}")
+                    state_payload["last_max_value"] = str(max_value)
+                self.state_manager.update_state(model_name, state_payload)
+                if debug and not silent:
+                    meta_msg = ", ".join(f"{k}={v}" for k, v in state_payload.items())
+                    print(f"  - Updated state: {meta_msg}")
 
         return cache
 
-    def _get_downstream(self, model: str) -> set[str]:
-        """Get all models that depend on this model"""
+    def _get_ancestors(self, model: str) -> set[str]:
+        """Get all upstream dependencies for a model"""
         dag = self.build_dag()
-        downstream = set()
+        ancestors = set()
 
         def visit(node: str):
-            for other, deps in dag.items():
-                if node in deps and other not in downstream:
-                    downstream.add(other)
-                    visit(other)
+            for dep in dag.get(node, []):
+                if dep not in ancestors:
+                    ancestors.add(dep)
+                    visit(dep)
 
         visit(model)
-        return downstream
+        return ancestors
 
     def read_table(self, table_name: str) -> pl.DataFrame:
         """Read a materialized table from disk"""

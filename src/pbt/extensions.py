@@ -2,6 +2,8 @@
 
 import polars as pl
 
+from pbt.utils import parse_timestamp_value
+
 
 def incremental_filter(self, column: str):
     """Filter dataframe for incremental processing based on last run state
@@ -22,9 +24,18 @@ def incremental_filter(self, column: str):
     target_table = meta.get("target_table")
     state_manager = meta.get("state_manager")
     full_refresh = meta.get("full_refresh", False)
+    rerun_range = meta.get("reprocess_range")
 
     if not target_table or not state_manager:
         return self
+
+    # Check rerun overrides first – these take precedence over incremental state
+    if rerun_range:
+        start_value, end_value = rerun_range
+        expr = pl.col(column) >= pl.lit(parse_timestamp_value(start_value))
+        if end_value:
+            expr = expr & (pl.col(column) <= pl.lit(parse_timestamp_value(end_value)))
+        return self.filter(expr)
 
     # Check if this is a full refresh or first run
     if full_refresh:
@@ -38,17 +49,7 @@ def incremental_filter(self, column: str):
         return self
 
     # Filter for records after last max value
-    # Parse the string value back to appropriate type using pl.lit
-    # pl.lit will infer the type and convert appropriately
-    try:
-        # Try parsing as datetime first
-        from datetime import datetime
-        parsed_value = datetime.fromisoformat(last_max_value.replace(" ", "T"))
-        filter_value = pl.lit(parsed_value)
-    except (ValueError, AttributeError):
-        # Fall back to string comparison or numeric
-        filter_value = pl.lit(last_max_value)
-
+    filter_value = pl.lit(parse_timestamp_value(last_max_value))
     return self.filter(pl.col(column) > filter_value)
 
 
