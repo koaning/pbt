@@ -9,10 +9,10 @@ This example demonstrates:
 - Targeted reruns via Model.rerun()
 """
 
-import polars as pl
-from pathlib import Path
 import sys
-from datetime import datetime
+from pathlib import Path
+
+import polars as pl
 
 # Add parent directory to path to import pbt
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -27,18 +27,16 @@ app = conf(root=Path(__file__).parent)
 def raw_events():
     """Load raw events from CSV - always recomputed"""
     csv_path = Path(__file__).parent / "raw.csv"
-    return pl.scan_csv(csv_path).with_columns(
-        pl.col('timestamp').str.to_datetime()
-    )
+    return pl.scan_csv(csv_path).with_columns(pl.col("timestamp").str.to_datetime())
 
 
 @app.model
 def cleaned_events(raw_events):
     """Clean and validate events - lazy view, not materialized"""
     return raw_events.filter(
-        pl.col('user').is_not_null() &
-        pl.col('event').is_not_null() &
-        pl.col('timestamp').is_not_null()
+        pl.col("user").is_not_null()
+        & pl.col("event").is_not_null()
+        & pl.col("timestamp").is_not_null()
     )
 
 
@@ -49,28 +47,27 @@ def events(cleaned_events):
 
     On subsequent runs, only processes events with timestamp > last max.
     """
-    return (
-        cleaned_events
-        .select(['user', 'event', 'timestamp'])
-    )
+    return cleaned_events.select(["user", "event", "timestamp"])
 
 
 @app.table
 def user_summary(cleaned_events):
     """Aggregated user statistics - full refresh each run"""
     return (
-        cleaned_events
-        .group_by('user')
-        .agg([
-            pl.len().alias('total_events'),
-            pl.col('timestamp').min().alias('first_event'),
-            pl.col('timestamp').max().alias('last_event')
-        ])
-        .with_columns(
-            ((pl.col('last_event') - pl.col('first_event')).dt.total_seconds() / 60)
-            .alias('session_duration_minutes')
+        cleaned_events.group_by("user")
+        .agg(
+            [
+                pl.len().alias("total_events"),
+                pl.col("timestamp").min().alias("first_event"),
+                pl.col("timestamp").max().alias("last_event"),
+            ]
         )
-        .sort('user')
+        .with_columns(
+            (
+                (pl.col("last_event") - pl.col("first_event")).dt.total_seconds() / 60
+            ).alias("session_duration_minutes")
+        )
+        .sort("user")
     )
 
 
@@ -78,23 +75,30 @@ def user_summary(cleaned_events):
 def daily_stats(cleaned_events):
     """Daily event statistics - full refresh each run"""
     return (
-        cleaned_events
-        .with_columns(pl.col('timestamp').dt.date().alias('date'))
-        .group_by('date')
-        .agg([
-            pl.len().alias('total_events'),
-            pl.col('user').n_unique().alias('unique_users'),
-            pl.col('event').filter(pl.col('event') == 'purchase').len().alias('purchases')
-        ])
-        .sort('date')
+        cleaned_events.with_columns(pl.col("timestamp").dt.date().alias("date"))
+        .group_by("date")
+        .agg(
+            [
+                pl.len().alias("total_events"),
+                pl.col("user").n_unique().alias("unique_users"),
+                pl.col("event")
+                .filter(pl.col("event") == "purchase")
+                .len()
+                .alias("purchases"),
+            ]
+        )
+        .sort("date")
     )
+
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Process user events with PBT")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--full-refresh", action="store_true", help="Force full refresh of all tables")
+    parser.add_argument(
+        "--full-refresh", action="store_true", help="Force full refresh of all tables"
+    )
     args = parser.parse_args()
 
     # Run the PBT pipeline
@@ -114,13 +118,13 @@ if __name__ == "__main__":
     user_summary_lf = user_summary.build_lazy()
     print(user_summary_lf.collect())
 
-    rerun_start = datetime(2025, 1, 15, 18, 0, 0)
-    rerun_end = datetime(2025, 1, 15, 19, 0, 0)
-    print(f"\nRe-running events between {rerun_start} and {rerun_end}:")
-    rerun_df = events.rerun(rerun_start, rerun_end, debug=args.debug, silent=True)
-    print(
-        rerun_df.filter(
-            (pl.col('timestamp') >= rerun_start) &
-            (pl.col('timestamp') <= rerun_end)
-        )
-    )
+    # rerun_start = datetime(2025, 1, 15, 18, 0, 0)
+    # rerun_end = datetime(2025, 1, 15, 19, 0, 0)
+    # print(f"\nRe-running events between {rerun_start} and {rerun_end}:")
+    # rerun_df = events.rerun(rerun_start, rerun_end, debug=args.debug, silent=True)
+    # print(
+    #     rerun_df.filter(
+    #         (pl.col('timestamp') >= rerun_start) &
+    #         (pl.col('timestamp') <= rerun_end)
+    #     )
+    # )
