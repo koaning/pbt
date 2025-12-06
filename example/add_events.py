@@ -16,7 +16,6 @@ from pathlib import Path
 
 import polars as pl
 
-
 RAW_FILE = "raw.csv"
 
 
@@ -162,5 +161,10 @@ if __name__ == "__main__":
     new_events = build_new_events_for_date(target_date)
     add_events(new_events)
 
-    print(f"\nGenerated events for {target_date}:")
-    print(pl.DataFrame(new_events))
+    print(f"\nGenerated events for {target_date}. Summary:")
+    print(
+        pl.read_csv(raw_path)
+        .group_by(pl.col("timestamp").str.slice(0, 10))
+        .len()
+        .sort("timestamp")
+    )
