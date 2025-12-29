@@ -4,12 +4,16 @@ import inspect
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import polars as pl
 
+from pbt.exceptions import PartitionSchemaError
 from pbt.state import StateManager
 from pbt.utils import coerce_datetime, parse_timestamp_value
+
+if TYPE_CHECKING:
+    from pbt.sinks.base import Sink
 
 
 class Model:
@@ -57,12 +61,12 @@ class Model:
                 f"'{self.name}' is a {self.model_type}, not a table. "
                 "Only materialized tables can be scanned lazily."
             )
-        output_path = self.app.root / "output" / f"{self.name}.parquet"
-        if not output_path.exists():
+        sink = self.config.get("sink") or self.app._default_sink
+        if not sink.exists(self.name):
             raise FileNotFoundError(
                 f"Table '{self.name}' has not been materialized yet. Run app.run() first."
             )
-        return pl.scan_parquet(output_path)
+        return sink.read(self.name)
 
     def rerun(
         self,
@@ -82,11 +86,15 @@ class PBTApp:
     """Main PBT application that manages models and execution"""
 
     def __init__(self, root: str | Path = ".", env: str = "dev"):
+        from pbt.sinks.local import LocalSink
+
         self.root = Path(root)
         self.env = env
         self.models: Dict[str, Dict[str, Any]] = {}
         self.state_manager = StateManager(self.root / ".pbt" / "state.json")
         self._rerun_ranges: Dict[str, Tuple[str, str]] = {}
+        # Default sink for backwards compatibility
+        self._default_sink: "Sink" = LocalSink(self.root / "output")
 
     def source(self, func: Callable) -> Model:
         """Decorator for source tables - always recomputed"""
@@ -115,21 +123,41 @@ class PBTApp:
         incremental: bool = False,
         time_column: Optional[str] = None,
         unique_key: Optional[str | list[str]] = None,
-        partition_by: Optional[str] = None
+        partition_by: Optional[str | list[str]] = None,
+        partition_mode: str = "append",
+        sink: Optional["Sink"] = None,
     ) -> Model:
-        """Decorator for materialized tables - writes to parquet"""
+        """Decorator for materialized tables - writes to sink.
+
+        Args:
+            func: The function to decorate (for @app.table without parens)
+            incremental: Whether this is an incremental table
+            time_column: Column to use for incremental watermark
+            unique_key: Column(s) for deduplication (future use)
+            partition_by: Column(s) to partition by (Hive-style)
+            partition_mode: "append" or "overwrite" for partition handling
+            sink: Sink to write to (defaults to LocalSink at root/output)
+        """
+
         def decorator(f: Callable) -> Model:
+            # Normalize partition_by to list
+            pb = None
+            if partition_by is not None:
+                pb = [partition_by] if isinstance(partition_by, str) else list(partition_by)
+
             config = {
                 "incremental": incremental,
                 "time_column": time_column,
                 "unique_key": unique_key,
-                "partition_by": partition_by
+                "partition_by": pb,
+                "partition_mode": partition_mode,
+                "sink": sink,
             }
             model = Model(f, self, "table", config)
             self.models[f.__name__] = {
                 "func": model,
                 "type": "table",
-                "config": config
+                "config": config,
             }
             return model
 
@@ -144,15 +172,28 @@ class PBTApp:
         *,
         time_column: str,
         unique_key: Optional[str | list[str]] = None,
-        partition_by: Optional[str] = None
+        partition_by: Optional[str | list[str]] = None,
+        partition_mode: str = "append",
+        sink: Optional["Sink"] = None,
     ) -> Model:
-        """Sugar for incremental tables that auto-applies incremental_filter"""
+        """Sugar for incremental tables that auto-applies incremental_filter.
+
+        Args:
+            time_column: Column to use for incremental watermark (required)
+            unique_key: Column(s) for deduplication (future use)
+            partition_by: Column(s) to partition by (Hive-style)
+            partition_mode: "append" or "overwrite" for partition handling
+            sink: Sink to write to (defaults to LocalSink at root/output)
+        """
+
         def decorator(func: Callable) -> Model:
             base_decorator = self.table(
                 incremental=True,
                 time_column=time_column,
                 unique_key=unique_key,
-                partition_by=partition_by
+                partition_by=partition_by,
+                partition_mode=partition_mode,
+                sink=sink,
             )
 
             @wraps(func)
@@ -240,13 +281,35 @@ class PBTApp:
 
         return result
 
-    def run(self, target: Optional[str] = None, full_refresh: bool = False, debug: bool = False, silent: bool = False) -> Dict[str, Any]:
-        """Execute models in dependency order and return execution cache"""
+    def run(
+        self,
+        target: Optional[str] = None,
+        full_refresh: bool = False,
+        debug: bool = False,
+        silent: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute models in dependency order and return execution cache.
+
+        Args:
+            target: Only run this model and its dependencies
+            full_refresh: Ignore existing data and rewrite from scratch
+            debug: Print detailed debug information
+            silent: Suppress all output
+            dry_run: Show what would happen without actually writing
+
+        Returns:
+            Dict mapping model names to their results.
+            If dry_run=True, also includes "dry_run_plans" key with write plans.
+        """
+        from pbt.sinks.base import DryRunPlan
+
         execution_order = self.topological_sort()
 
         if debug and not silent:
             print(f"\n[DEBUG] Execution order: {' -> '.join(execution_order)}")
             print(f"[DEBUG] Full refresh: {full_refresh}")
+            print(f"[DEBUG] Dry run: {dry_run}")
             if target:
                 print(f"[DEBUG] Target model: {target}")
 
@@ -255,6 +318,7 @@ class PBTApp:
             execution_order = [m for m in execution_order if m in needed]
 
         cache = {}
+        dry_run_plans: list[DryRunPlan] = []
 
         for model_name in execution_order:
             model_info = self.models[model_name]
@@ -272,12 +336,12 @@ class PBTApp:
                 if param_name in cache:
                     df = cache[param_name]
                     # Inject metadata for incremental operations
-                    if hasattr(df, '_pbt_metadata'):
+                    if hasattr(df, "_pbt_metadata"):
                         df._pbt_metadata = {
                             "target_table": model_name,
                             "state_manager": self.state_manager,
                             "full_refresh": full_refresh,
-                            "reprocess_range": self._rerun_ranges.get(model_name)
+                            "reprocess_range": self._rerun_ranges.get(model_name),
                         }
                     kwargs[param_name] = df
 
@@ -300,8 +364,13 @@ class PBTApp:
 
             # Materialize if it's a table
             if model_type == "table":
-                output_path = self.root / "output" / f"{model_name}.parquet"
-                output_path.parent.mkdir(parents=True, exist_ok=True)
+                sink = config.get("sink") or self._default_sink
+                partition_by = config.get("partition_by")
+                partition_mode = config.get("partition_mode", "append")
+
+                # Check for partition schema changes (unless full_refresh)
+                if not full_refresh:
+                    self._check_partition_schema(model_name, partition_by, partition_mode)
 
                 collected = result.collect()
 
@@ -310,56 +379,172 @@ class PBTApp:
 
                 reprocess_range = self._rerun_ranges.get(model_name)
 
-                # Handle incremental append
-                if config.get("incremental"):
-                    if output_path.exists() and not full_refresh:
-                        # Read existing data and append new records
-                        existing = pl.read_parquet(output_path)
-                        new_rows = len(collected)
+                # Handle incremental merge with existing data
+                if config.get("incremental") and not full_refresh:
+                    collected = self._apply_incremental_merge(
+                        model_name, collected, config, sink, reprocess_range, debug, silent
+                    )
 
-                        if reprocess_range and config.get("time_column"):
-                            start_value, end_value = reprocess_range
-                            start_literal = pl.lit(parse_timestamp_value(start_value))
-                            end_literal = pl.lit(parse_timestamp_value(end_value))
-                            existing = existing.filter(
-                                (pl.col(config["time_column"]) < start_literal) |
-                                (pl.col(config["time_column"]) > end_literal)
-                            )
+                # Write via sink
+                write_result = sink.write(
+                    df=collected,
+                    name=model_name,
+                    partition_by=partition_by,
+                    partition_mode=partition_mode,
+                    dry_run=dry_run,
+                )
 
-                        collected = pl.concat([existing, collected])
-
-                        if reprocess_range and config.get("time_column"):
-                            collected = collected.sort(config["time_column"])
-
-                        if debug and not silent:
-                            print(f"  - Existing rows: {len(existing)}, New rows: {new_rows}, Total: {len(collected)}")
-                        if not silent:
-                            if reprocess_range:
-                                print(f"  -> Reprocessed {new_rows} rows for window {reprocess_range} in {output_path}")
-                            else:
-                                print(f"  -> Appended {new_rows} new rows to {output_path}")
-                    else:
-                        if not silent:
-                            print(f"  -> Wrote {output_path} (initial load)")
+                if dry_run:
+                    dry_run_plans.append(write_result)
+                    if not silent:
+                        self._print_dry_run_plan(write_result)
                 else:
                     if not silent:
-                        print(f"  -> Wrote {output_path}")
+                        self._print_write_result(model_name, write_result, config)
 
-                # Write combined data
-                collected.write_parquet(output_path)
+                    # Update state metadata
+                    self._update_table_state(
+                        model_name, collected, config, partition_by, partition_mode
+                    )
+                    if debug and not silent:
+                        state = self.state_manager.get_state(model_name)
+                        meta_msg = ", ".join(f"{k}={v}" for k, v in state.items())
+                        print(f"  - Updated state: {meta_msg}")
 
-                # Update state metadata for observability
-                state_payload = {"last_run": datetime.utcnow().isoformat()}
-                if config.get("incremental") and config.get("time_column"):
-                    time_col = config["time_column"]
-                    max_value = collected.select(time_col).max().item()
-                    state_payload["last_max_value"] = str(max_value)
-                self.state_manager.update_state(model_name, state_payload)
-                if debug and not silent:
-                    meta_msg = ", ".join(f"{k}={v}" for k, v in state_payload.items())
-                    print(f"  - Updated state: {meta_msg}")
+        if dry_run:
+            cache["dry_run_plans"] = dry_run_plans
 
         return cache
+
+    def _check_partition_schema(
+        self,
+        model_name: str,
+        partition_by: Optional[list[str]],
+        partition_mode: str,
+    ) -> None:
+        """Check for partition schema changes and error if mismatch."""
+        state = self.state_manager.get_state(model_name)
+        if not state:
+            return  # No existing state, nothing to check
+
+        stored_partition_by = state.get("partition_by")
+        stored_partition_mode = state.get("partition_mode")
+
+        # Only check if we have stored partition config
+        if stored_partition_by is not None or stored_partition_mode is not None:
+            current_pb = partition_by or []
+            stored_pb = stored_partition_by or []
+
+            if current_pb != stored_pb:
+                raise PartitionSchemaError(
+                    f"Partition schema changed for '{model_name}'.\n"
+                    f"  Stored: partition_by={stored_pb}\n"
+                    f"  Current: partition_by={current_pb}\n"
+                    f"Run with full_refresh=True to rewrite the table."
+                )
+
+            if stored_partition_mode and partition_mode != stored_partition_mode:
+                raise PartitionSchemaError(
+                    f"Partition mode changed for '{model_name}'.\n"
+                    f"  Stored: partition_mode={stored_partition_mode}\n"
+                    f"  Current: partition_mode={partition_mode}\n"
+                    f"Run with full_refresh=True to confirm this change."
+                )
+
+    def _apply_incremental_merge(
+        self,
+        model_name: str,
+        new_data: pl.DataFrame,
+        config: dict,
+        sink,
+        reprocess_range: Optional[Tuple[str, str]],
+        debug: bool,
+        silent: bool,
+    ) -> pl.DataFrame:
+        """Merge new data with existing for incremental tables."""
+        if not sink.exists(model_name):
+            return new_data
+
+        partition_by = config.get("partition_by")
+        partition_mode = config.get("partition_mode", "append")
+        time_column = config.get("time_column")
+
+        # For partition overwrite mode, the sink handles replacement
+        # We just return the new data as-is
+        if partition_by and partition_mode == "overwrite":
+            return new_data
+
+        # For non-partitioned or append mode: merge with existing data
+        new_rows = len(new_data)
+        existing = sink.read(model_name).collect()
+
+        # Remove reprocessed rows if applicable
+        if reprocess_range and time_column:
+            start_value, end_value = reprocess_range
+            start_literal = pl.lit(parse_timestamp_value(start_value))
+            end_literal = pl.lit(parse_timestamp_value(end_value))
+            existing = existing.filter(
+                (pl.col(time_column) < start_literal)
+                | (pl.col(time_column) > end_literal)
+            )
+
+        collected = pl.concat([existing, new_data])
+
+        # Sort by time column if reprocessing
+        if reprocess_range and time_column:
+            collected = collected.sort(time_column)
+
+        if debug and not silent:
+            print(
+                f"  - Existing rows: {len(existing)}, New rows: {new_rows}, Total: {len(collected)}"
+            )
+
+        return collected
+
+    def _update_table_state(
+        self,
+        model_name: str,
+        data: pl.DataFrame,
+        config: dict,
+        partition_by: Optional[list[str]],
+        partition_mode: str,
+    ) -> None:
+        """Update state with partition metadata."""
+        state_payload = {
+            "last_run": datetime.utcnow().isoformat(),
+            "partition_by": partition_by,
+            "partition_mode": partition_mode,
+        }
+
+        if config.get("incremental") and config.get("time_column"):
+            time_col = config["time_column"]
+            max_value = data.select(time_col).max().item()
+            state_payload["last_max_value"] = str(max_value)
+
+        self.state_manager.update_state(model_name, state_payload)
+
+    def _print_dry_run_plan(self, plan) -> None:
+        """Print dry-run plan details."""
+        print(f"\n[DRY RUN] {plan.table_name}")
+        print(f"  Destination: {plan.destination}")
+        print(f"  Rows to write: {plan.rows_to_write}")
+        if plan.partitions_affected:
+            print(f"  Partitions affected ({len(plan.partitions_affected)}):")
+            for p in plan.partitions_affected[:10]:  # Limit output
+                op = plan.partition_operations.get(p, "unknown")
+                print(f"    - {p} [{op}]")
+            if len(plan.partitions_affected) > 10:
+                print(f"    ... and {len(plan.partitions_affected) - 10} more")
+
+    def _print_write_result(self, model_name: str, result, config: dict) -> None:
+        """Print write result summary."""
+        if result.partitions_affected:
+            print(
+                f"  -> Wrote {result.rows_written} rows to {len(result.partitions_affected)} partitions"
+            )
+        else:
+            op = "initial load" if result.operation == "create" else result.operation
+            print(f"  -> Wrote {result.destination} ({op})")
 
     def _get_ancestors(self, model: str) -> set[str]:
         """Get all upstream dependencies for a model"""
@@ -376,19 +561,26 @@ class PBTApp:
         return ancestors
 
     def read_table(self, table_name: str) -> pl.DataFrame:
-        """Read a materialized table from disk"""
+        """Read a materialized table from sink."""
         if table_name not in self.models:
-            raise ValueError(f"Model '{table_name}' not found. Available: {list(self.models.keys())}")
+            raise ValueError(
+                f"Model '{table_name}' not found. Available: {list(self.models.keys())}"
+            )
 
-        model_type = self.models[table_name]["type"]
-        if model_type != "table":
-            raise ValueError(f"'{table_name}' is a {model_type}, not a table. Use read_table() only for materialized tables.")
+        model_info = self.models[table_name]
+        if model_info["type"] != "table":
+            raise ValueError(
+                f"'{table_name}' is a {model_info['type']}, not a table. "
+                "Use read_table() only for materialized tables."
+            )
 
-        output_path = self.root / "output" / f"{table_name}.parquet"
-        if not output_path.exists():
-            raise FileNotFoundError(f"Table '{table_name}' has not been materialized yet. Run app.run() first.")
+        sink = model_info["config"].get("sink") or self._default_sink
+        if not sink.exists(table_name):
+            raise FileNotFoundError(
+                f"Table '{table_name}' has not been materialized yet. Run app.run() first."
+            )
 
-        return pl.read_parquet(output_path)
+        return sink.read(table_name).collect()
 
     def get_model(self, model_name: str) -> Dict[str, Any]:
         """Get model metadata and function"""

@@ -16,6 +16,7 @@ data/
 *.parquet
 .pbt/
 output/
+partitioned_output/
 
 # IDE
 .vscode/
