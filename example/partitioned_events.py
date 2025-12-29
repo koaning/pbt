@@ -154,7 +154,8 @@ if __name__ == "__main__":
         print(df.head(5))
 
         print("\nFilter to specific date (partition pruning):")
+        from datetime import date
         df_filtered = partitioned_sink.read(
-            "events_by_date", partition_filter={"date": "2025-01-15"}
+            "events_by_date", partition_filter={"date": date(2025, 1, 15)}
         ).collect()
         print(f"Rows for 2025-01-15: {len(df_filtered)}")

@@ -1,13 +1,13 @@
 {
   "events_by_date": {
-    "last_run": "2025-12-29T14:50:46.504351",
+    "last_run": "2025-12-29T16:06:12.159717",
     "partition_by": [
       "date"
     ],
     "partition_mode": "overwrite"
   },
   "events_incremental": {
-    "last_run": "2025-12-29T14:50:46.546558",
+    "last_run": "2025-12-29T16:06:12.170780",
     "partition_by": [
       "date"
     ],
@@ -15,7 +15,7 @@
     "last_max_value": "2025-02-02 20:18:45"
   },
   "events_by_user_date": {
-    "last_run": "2025-12-29T14:50:46.623282",
+    "last_run": "2025-12-29T16:06:12.203222",
     "partition_by": [
       "user",
       "date"
