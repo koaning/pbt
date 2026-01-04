@@ -1,7 +1,7 @@
 """Core PBT functionality: conf, decorators, and execution"""
 
 import inspect
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
@@ -511,7 +511,7 @@ class PBTApp:
     ) -> None:
         """Update state with partition metadata."""
         state_payload = {
-            "last_run": datetime.utcnow().isoformat(),
+            "last_run": datetime.now(UTC).isoformat(),
             "partition_by": partition_by,
             "partition_mode": partition_mode,
         }
