@@ -67,9 +67,8 @@ def duckdb_scan(
     # Connect and execute
     con = duckdb.connect(connection_string)
     try:
-        result = con.execute(sql).pl()
+        result = con.execute(sql).pl(lazy=True)
     finally:
         con.close()
 
-    # Return as lazy for consistency with PBT pipeline
-    return result.lazy()
+    return result

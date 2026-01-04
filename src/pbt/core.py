@@ -469,9 +469,9 @@ class PBTApp:
         partition_mode = config.get("partition_mode", "append")
         time_column = config.get("time_column")
 
-        # For partition overwrite mode, the sink handles replacement
-        # We just return the new data as-is
-        if partition_by and partition_mode == "overwrite":
+        # For partitioned tables, let the sink handle the merge logic
+        # (both append and overwrite modes - sink knows how to handle each)
+        if partition_by:
             return new_data
 
         # For non-partitioned or append mode: merge with existing data
