@@ -14,7 +14,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "duckdb>=1.0.0",
     "pre-commit>=4.0.1",
+    "pyarrow>=15.0.0",
+    "pytest>=8.0.0",
 ]
 
 [build-system]

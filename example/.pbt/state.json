@@ -1,12 +1,25 @@
 {
-  "events": {
-    "last_max_value": "2025-02-02 20:18:45",
-    "last_run": "2025-12-06T19:55:20.354548"
+  "events_by_date": {
+    "last_run": "2025-12-29T16:06:12.159717",
+    "partition_by": [
+      "date"
+    ],
+    "partition_mode": "overwrite"
   },
-  "user_summary": {
-    "last_run": "2025-12-06T19:55:20.367160"
+  "events_incremental": {
+    "last_run": "2025-12-29T16:06:12.170780",
+    "partition_by": [
+      "date"
+    ],
+    "partition_mode": "append",
+    "last_max_value": "2025-02-02 20:18:45"
   },
-  "daily_stats": {
-    "last_run": "2025-12-06T19:55:20.372150"
+  "events_by_user_date": {
+    "last_run": "2025-12-29T16:06:12.203222",
+    "partition_by": [
+      "user",
+      "date"
+    ],
+    "partition_mode": "append"
   }
 }
