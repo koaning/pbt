@@ -1,33 +1,5 @@
 # Agent Instructions
 
-## Development Setup
-
-We use [uv](https://docs.astral.sh/uv/) for all Python dependency management and virtual environment setup in this project.
-
-### Why uv?
-
-- **Fast**: Orders of magnitude faster than pip
-- **Reliable**: Deterministic dependency resolution with lockfiles
-- **Smart**: Automatically handles existing virtual environments
-- **Simple**: Single tool for venv creation, package installation, and running scripts
-
-### Common Commands
-
-```bash
-# Setup (works with new or existing venvs)
-uv venv
-uv sync
-
-# Run scripts without activation
-uv run python script.py
-
-# Add dependencies
-uv add package-name
-
-# Update dependencies
-uv sync
-```
-
 ### For AI Agents
 
 When working on this codebase:
@@ -48,7 +20,7 @@ uv venv && uv sync
 uv run pytest
 
 # Run the example
-uv run python example.py
+uv run example.py
 
 # Or use make targets
 make install
@@ -63,3 +35,6 @@ make test
 - Virtual environment is `.venv/` (gitignored)
 - Generated data files go in `data/` (gitignored)
 - **Use Polars, not Pandas** - All data manipulation uses `polars` for performance and consistency
+- Strongly prefer altair over matplotlib and pathlib over os.path 
+
+Be extremely concise. Sacrifice grammar for the sake of concision.
