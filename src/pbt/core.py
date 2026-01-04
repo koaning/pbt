@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 import polars as pl
 
 from pbt.exceptions import PartitionSchemaError
-from pbt.state import StateManager
 from pbt.utils import coerce_datetime, parse_timestamp_value
+from pbt.meta import SchemaManager, SchemaChangeError, TableMeta
 
 if TYPE_CHECKING:
     from pbt.sinks.base import Sink
@@ -48,7 +48,7 @@ class Model:
             if result is None:
                 raise RuntimeError(f"Model '{self.name}' was not executed successfully")
             # Collect if lazy
-            if hasattr(result, 'collect'):
+            if hasattr(result, "collect"):
                 return result.collect()
             return result
 
@@ -74,12 +74,42 @@ class Model:
         max_date: datetime | str,
         *,
         debug: bool = False,
-        silent: bool = False
+        silent: bool = False,
     ) -> pl.DataFrame:
         """Reprocess a specific time window for incremental tables."""
         if self.model_type != "table":
             raise ValueError("Only materialized tables support rerun()")
-        return self.app.rerun_table(self.name, min_date, max_date, debug=debug, silent=silent)
+        return self.app.rerun_table(
+            self.name, min_date, max_date, debug=debug, silent=silent
+        )
+
+    def get_meta(self) -> TableMeta:
+        """Get metadata for this model including column types and descriptions.
+
+        Returns:
+            TableMeta with column names, types (auto-detected from schema),
+            and descriptions (from .pbt/tables/{name}.yml if available).
+
+        For tables: Reads schema from materialized parquet file.
+        For models/sources: Builds the model to get schema from result.
+        """
+        # Get Polars schema
+        if self.model_type == "table":
+            sink = self.config.get("sink") or self.app._default_sink
+            if not sink.exists(self.name):
+                raise FileNotFoundError(
+                    f"Table '{self.name}' has not been materialized yet. "
+                    "Run app.run() first to generate metadata."
+                )
+            # Read schema from the sink
+            lf = sink.read(self.name)
+            schema = lf.collect_schema()
+        else:
+            # For models/sources, we need to execute to get schema
+            result = self.build()
+            schema = result.schema
+
+        return self.app.schema_manager.build_table_meta(self.name, schema)
 
 
 class PBTApp:
@@ -91,7 +121,7 @@ class PBTApp:
         self.root = Path(root)
         self.env = env
         self.models: Dict[str, Dict[str, Any]] = {}
-        self.state_manager = StateManager(self.root / ".pbt" / "state.json")
+        self.schema_manager = SchemaManager(self.root)
         self._rerun_ranges: Dict[str, Tuple[str, str]] = {}
         # Default sink for backwards compatibility
         self._default_sink: "Sink" = LocalSink(self.root / "output")
@@ -99,21 +129,13 @@ class PBTApp:
     def source(self, func: Callable) -> Model:
         """Decorator for source tables - always recomputed"""
         model = Model(func, self, "source", {})
-        self.models[func.__name__] = {
-            "func": model,
-            "type": "source",
-            "config": {}
-        }
+        self.models[func.__name__] = {"func": model, "type": "source", "config": {}}
         return model
 
     def model(self, func: Callable) -> Model:
         """Decorator for view models - lazy evaluation, not materialized"""
         model = Model(func, self, "model", {})
-        self.models[func.__name__] = {
-            "func": model,
-            "type": "model",
-            "config": {}
-        }
+        self.models[func.__name__] = {"func": model, "type": "model", "config": {}}
         return model
 
     def table(
@@ -215,7 +237,7 @@ class PBTApp:
         max_date: datetime | str,
         *,
         debug: bool = False,
-        silent: bool = False
+        silent: bool = False,
     ) -> pl.DataFrame:
         """Reprocess a specific window for an incremental table."""
         model_info = self.get_model(table_name)
@@ -224,7 +246,9 @@ class PBTApp:
         if model_info["type"] != "table":
             raise ValueError(f"'{table_name}' is not a table")
         if not config.get("incremental") or not config.get("time_column"):
-            raise ValueError("rerun() is only available for incremental tables with a time_column")
+            raise ValueError(
+                "rerun() is only available for incremental tables with a time_column"
+            )
 
         start_dt = coerce_datetime(min_date, "min_date")
         end_dt = coerce_datetime(max_date, "max_date")
@@ -250,8 +274,7 @@ class PBTApp:
             target = func
         sig = inspect.signature(target)
         return [
-            param.name for param in sig.parameters.values()
-            if param.name in self.models
+            param.name for param in sig.parameters.values() if param.name in self.models
         ]
 
     def build_dag(self) -> Dict[str, list[str]]:
@@ -285,6 +308,7 @@ class PBTApp:
         self,
         target: Optional[str] = None,
         full_refresh: bool = False,
+        safe: bool = True,
         debug: bool = False,
         silent: bool = False,
         dry_run: bool = False,
@@ -294,6 +318,7 @@ class PBTApp:
         Args:
             target: Only run this model and its dependencies
             full_refresh: Ignore existing data and rewrite from scratch
+            safe: If True (default), raise SchemaChangeError when schema changes are detected
             debug: Print detailed debug information
             silent: Suppress all output
             dry_run: Show what would happen without actually writing
@@ -339,7 +364,7 @@ class PBTApp:
                     if hasattr(df, "_pbt_metadata"):
                         df._pbt_metadata = {
                             "target_table": model_name,
-                            "state_manager": self.state_manager,
+                            "schema_manager": self.schema_manager,
                             "full_refresh": full_refresh,
                             "reprocess_range": self._rerun_ranges.get(model_name),
                         }
@@ -351,10 +376,14 @@ class PBTApp:
                 print(f"  - Type: {model_type}")
                 print(f"  - Dependencies: {deps if deps else 'none'}")
                 if config.get("incremental"):
-                    print(f"  - Incremental: True (time_column={config.get('time_column')})")
-                    state = self.state_manager.get_state(model_name)
+                    print(
+                        f"  - Incremental: True (time_column={config.get('time_column')})"
+                    )
+                    state = self.schema_manager.get_state(model_name)
                     if state:
-                        print(f"  - Last max value: {state.get('last_max_value', 'N/A')}")
+                        print(
+                            f"  - Last max value: {state.get('last_max_value', 'N/A')}"
+                        )
 
             # Execute model
             if not silent:
@@ -376,6 +405,20 @@ class PBTApp:
 
                 if debug and not silent:
                     print(f"  - Collected {len(collected)} rows")
+
+                # Check for schema changes before writing
+                current_schema = collected.schema
+                changes = self.schema_manager.detect_changes(model_name, current_schema)
+
+                if changes.has_changes:
+                    if safe:
+                        raise SchemaChangeError(
+                            f"Schema change detected for '{model_name}': {changes}\n"
+                            f"Run with safe=False to proceed, or update .pbt/tables/{model_name}.yml"
+                        )
+                    else:
+                        if not silent:
+                            print(f"  Warning: Schema change: {changes}")
 
                 reprocess_range = self._rerun_ranges.get(model_name)
 
@@ -402,12 +445,19 @@ class PBTApp:
                     if not silent:
                         self._print_write_result(model_name, write_result, config)
 
+                    # Update/create schema file (preserves existing descriptions)
+                    is_new_schema = self.schema_manager.save_schema(
+                        model_name, current_schema
+                    )
+                    if is_new_schema and not silent:
+                        print(f"  -> Generated schema: .pbt/tables/{model_name}.yml")
+
                     # Update state metadata
                     self._update_table_state(
                         model_name, collected, config, partition_by, partition_mode
                     )
                     if debug and not silent:
-                        state = self.state_manager.get_state(model_name)
+                        state = self.schema_manager.get_state(model_name)
                         meta_msg = ", ".join(f"{k}={v}" for k, v in state.items())
                         print(f"  - Updated state: {meta_msg}")
 
@@ -423,7 +473,7 @@ class PBTApp:
         partition_mode: str,
     ) -> None:
         """Check for partition schema changes and error if mismatch."""
-        state = self.state_manager.get_state(model_name)
+        state = self.schema_manager.get_state(model_name)
         if not state:
             return  # No existing state, nothing to check
 
@@ -466,7 +516,6 @@ class PBTApp:
             return new_data
 
         partition_by = config.get("partition_by")
-        partition_mode = config.get("partition_mode", "append")
         time_column = config.get("time_column")
 
         # For partitioned tables, let the sink handle the merge logic
@@ -521,7 +570,7 @@ class PBTApp:
             max_value = data.select(time_col).max().item()
             state_payload["last_max_value"] = str(max_value)
 
-        self.state_manager.update_state(model_name, state_payload)
+        self.schema_manager.update_state(model_name, state_payload)
 
     def _print_dry_run_plan(self, plan) -> None:
         """Print dry-run plan details."""
@@ -585,7 +634,9 @@ class PBTApp:
     def get_model(self, model_name: str) -> Dict[str, Any]:
         """Get model metadata and function"""
         if model_name not in self.models:
-            raise ValueError(f"Model '{model_name}' not found. Available: {list(self.models.keys())}")
+            raise ValueError(
+                f"Model '{model_name}' not found. Available: {list(self.models.keys())}"
+            )
         return self.models[model_name]
 
 

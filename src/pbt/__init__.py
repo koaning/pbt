@@ -5,6 +5,7 @@ from pbt.exceptions import PartitionSchemaError, PBTError
 from pbt.extensions import setup_polars_extensions
 from pbt.sinks import LocalSink
 from pbt.sources import duckdb_scan
+from pbt.meta import ColumnMeta, TableMeta, SchemaChange, SchemaChangeError
 
 # Setup Polars extensions on import
 setup_polars_extensions()
@@ -15,4 +16,8 @@ __all__ = [
     "duckdb_scan",
     "PBTError",
     "PartitionSchemaError",
+    "ColumnMeta",
+    "TableMeta",
+    "SchemaChange",
+    "SchemaChangeError",
 ]
