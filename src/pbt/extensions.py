@@ -1,5 +1,7 @@
 """Polars LazyFrame extensions for PBT functionality"""
 
+from datetime import timedelta
+
 import polars as pl
 
 from pbt.utils import parse_timestamp_value
@@ -12,7 +14,8 @@ def incremental_filter(self, column: str):
         column: The timestamp/date column to filter on
 
     Returns:
-        Filtered LazyFrame with only new records, or original if first run
+        Filtered LazyFrame with only new records, or original if first run.
+        If lookback is configured, includes records from (last_max_value - lookback).
     """
     # Get metadata injected by PBT
     meta = getattr(self, "_pbt_metadata", None)
@@ -25,6 +28,7 @@ def incremental_filter(self, column: str):
     schema_manager = meta.get("schema_manager")
     full_refresh = meta.get("full_refresh", False)
     rerun_range = meta.get("reprocess_range")
+    lookback: timedelta | None = meta.get("lookback")
 
     if not target_table or not schema_manager:
         return self
@@ -48,9 +52,19 @@ def incremental_filter(self, column: str):
         # First run - process everything
         return self
 
-    # Filter for records after last max value
-    filter_value = pl.lit(parse_timestamp_value(last_max_value))
-    return self.filter(pl.col(column) > filter_value)
+    # Parse the last max value
+    filter_timestamp = parse_timestamp_value(last_max_value)
+
+    # Apply lookback if configured
+    if lookback is not None:
+        filter_timestamp = filter_timestamp - lookback
+
+    # Filter for records after the filter point
+    # Use >= when lookback is set (to include the boundary), > otherwise
+    if lookback is not None:
+        return self.filter(pl.col(column) >= pl.lit(filter_timestamp))
+    else:
+        return self.filter(pl.col(column) > pl.lit(filter_timestamp))
 
 
 def setup_polars_extensions():
