@@ -15,18 +15,18 @@ def incremental_filter(self, column: str):
         Filtered LazyFrame with only new records, or original if first run
     """
     # Get metadata injected by PBT
-    meta = getattr(self, '_pbt_metadata', None)
+    meta = getattr(self, "_pbt_metadata", None)
 
     if meta is None:
         # No metadata means we're outside PBT execution context
         return self
 
     target_table = meta.get("target_table")
-    state_manager = meta.get("state_manager")
+    schema_manager = meta.get("schema_manager")
     full_refresh = meta.get("full_refresh", False)
     rerun_range = meta.get("reprocess_range")
 
-    if not target_table or not state_manager:
+    if not target_table or not schema_manager:
         return self
 
     # Check rerun overrides first – these take precedence over incremental state
@@ -41,7 +41,7 @@ def incremental_filter(self, column: str):
     if full_refresh:
         return self
 
-    state = state_manager.get_state(target_table)
+    state = schema_manager.get_state(target_table)
     last_max_value = state.get("last_max_value")
 
     if last_max_value is None:
@@ -56,7 +56,7 @@ def incremental_filter(self, column: str):
 def setup_polars_extensions():
     """Monkeypatch Polars LazyFrame with PBT methods"""
     # Add metadata attribute if it doesn't exist
-    if not hasattr(pl.LazyFrame, '_pbt_metadata'):
+    if not hasattr(pl.LazyFrame, "_pbt_metadata"):
         pl.LazyFrame._pbt_metadata = None
 
     # Add incremental_filter method

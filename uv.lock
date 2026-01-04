@@ -119,6 +119,7 @@ source = { editable = "." }
 dependencies = [
     { name = "narwhals" },
     { name = "polars" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -137,6 +138,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.1" },
     { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=15.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 provides-extras = ["dev"]
 

@@ -35,6 +35,6 @@ make test
 - Virtual environment is `.venv/` (gitignored)
 - Generated data files go in `data/` (gitignored)
 - **Use Polars, not Pandas** - All data manipulation uses `polars` for performance and consistency
-- Strongly prefer altair over matplotlib and pathlib over os.path 
+- Strongly prefer altair over matplotlib and pathlib over os.path
 
 Be extremely concise. Sacrifice grammar for the sake of concision.
