@@ -57,165 +57,157 @@ def partitioned_df() -> pl.DataFrame:
     )
 
 
-class TestWriteReadRoundtrip:
-    """Test write/read roundtrip for all sinks."""
-
-    def test_simple_write_read(self, sink: Sink, sample_df: pl.DataFrame):
-        """Write and read back a simple table."""
-        result = sink.write(sample_df, "test_table")
-
-        assert result.rows_written == 3
-        assert result.operation in ("create", "append")
-
-        # Read back
-        read_df = sink.read("test_table").collect()
-        assert len(read_df) == 3
-        assert set(read_df.columns) == {"id", "name", "value"}
-        assert read_df["id"].to_list() == [1, 2, 3]
-
-    def test_partitioned_write_read(self, sink: Sink, partitioned_df: pl.DataFrame):
-        """Write and read back a partitioned table."""
-        result = sink.write(partitioned_df, "events", partition_by=["date"])
-
-        assert result.rows_written == 4
-        assert len(result.partitions_affected) == 2
-
-        # Read back all data
-        read_df = sink.read("events").collect()
-        assert len(read_df) == 4
-        assert "date" in read_df.columns
-
-    def test_partition_filter_read(self, sink: Sink, partitioned_df: pl.DataFrame):
-        """Read with partition filter."""
-        sink.write(partitioned_df, "events", partition_by=["date"])
-
-        # Filter to single partition
-        read_df = sink.read(
-            "events", partition_filter={"date": datetime.date(2025, 1, 1)}
-        ).collect()
-        assert len(read_df) == 2
-        assert all(d == datetime.date(2025, 1, 1) for d in read_df["date"].to_list())
+# Write/read roundtrip tests
 
 
-class TestExists:
-    """Test exists() method for all sinks."""
+def test_simple_write_read(sink: Sink, sample_df: pl.DataFrame):
+    """Write and read back a simple table."""
+    result = sink.write(sample_df, "test_table")
 
-    def test_exists_false_for_missing(self, sink: Sink):
-        """exists() returns False for non-existent table."""
-        assert sink.exists("nonexistent") is False
+    assert result.rows_written == 3
+    assert result.operation in ("create", "append")
 
-    def test_exists_true_after_write(self, sink: Sink, sample_df: pl.DataFrame):
-        """exists() returns True after writing."""
-        sink.write(sample_df, "test_table")
-        assert sink.exists("test_table") is True
-
-
-class TestPartitions:
-    """Test partition listing and deletion for all sinks."""
-
-    def test_list_partitions_empty_for_non_partitioned(
-        self, sink: Sink, sample_df: pl.DataFrame
-    ):
-        """list_partitions() returns empty for non-partitioned table."""
-        sink.write(sample_df, "test_table")
-        assert sink.list_partitions("test_table") == []
-
-    def test_list_partitions_returns_hive_style(
-        self, sink: Sink, partitioned_df: pl.DataFrame
-    ):
-        """list_partitions() returns Hive-style partition paths."""
-        sink.write(partitioned_df, "events", partition_by=["date"])
-
-        partitions = sink.list_partitions("events")
-        assert len(partitions) == 2
-        # Should be Hive-style format
-        assert all("date=" in p for p in partitions)
-        assert "date=2025-01-01" in partitions
-        assert "date=2025-01-02" in partitions
-
-    def test_delete_partitions(self, sink: Sink, partitioned_df: pl.DataFrame):
-        """delete_partitions() removes specified partitions."""
-        sink.write(partitioned_df, "events", partition_by=["date"])
-
-        # Delete one partition
-        sink.delete_partitions("events", ["date=2025-01-01"])
-
-        # Should only have the other partition
-        partitions = sink.list_partitions("events")
-        assert partitions == ["date=2025-01-02"]
-
-        # Data should reflect deletion
-        read_df = sink.read("events").collect()
-        assert len(read_df) == 2
-        assert all(d == datetime.date(2025, 1, 2) for d in read_df["date"].to_list())
+    read_df = sink.read("test_table").collect()
+    assert len(read_df) == 3
+    assert set(read_df.columns) == {"id", "name", "value"}
+    assert read_df["id"].to_list() == [1, 2, 3]
 
 
-class TestPartitionModes:
-    """Test append vs overwrite partition modes."""
+def test_partitioned_write_read(sink: Sink, partitioned_df: pl.DataFrame):
+    """Write and read back a partitioned table."""
+    result = sink.write(partitioned_df, "events", partition_by=["date"])
 
-    def test_append_mode_adds_data(self, sink: Sink):
-        """Append mode adds data to existing partitions."""
-        df1 = pl.DataFrame(
-            {
-                "id": [1, 2],
-                "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
-            }
-        )
-        df2 = pl.DataFrame(
-            {
-                "id": [3, 4],
-                "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
-            }
-        )
+    assert result.rows_written == 4
+    assert len(result.partitions_affected) == 2
 
-        sink.write(df1, "events", partition_by=["date"], partition_mode="append")
-        sink.write(df2, "events", partition_by=["date"], partition_mode="append")
-
-        read_df = sink.read("events").collect()
-        assert len(read_df) == 4
-        assert set(read_df["id"].to_list()) == {1, 2, 3, 4}
-
-    def test_overwrite_mode_replaces_partition(self, sink: Sink):
-        """Overwrite mode replaces data in existing partitions."""
-        df1 = pl.DataFrame(
-            {
-                "id": [1, 2],
-                "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
-            }
-        )
-        df2 = pl.DataFrame(
-            {
-                "id": [3, 4],
-                "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
-            }
-        )
-
-        sink.write(df1, "events", partition_by=["date"], partition_mode="append")
-        sink.write(df2, "events", partition_by=["date"], partition_mode="overwrite")
-
-        read_df = sink.read("events").collect()
-        assert len(read_df) == 2
-        assert set(read_df["id"].to_list()) == {3, 4}
+    read_df = sink.read("events").collect()
+    assert len(read_df) == 4
+    assert "date" in read_df.columns
 
 
-class TestDryRun:
-    """Test dry_run functionality."""
+def test_partition_filter_read(sink: Sink, partitioned_df: pl.DataFrame):
+    """Read with partition filter."""
+    sink.write(partitioned_df, "events", partition_by=["date"])
 
-    def test_dry_run_returns_plan(self, sink: Sink, sample_df: pl.DataFrame):
-        """dry_run=True returns plan without writing."""
-        plan = sink.write(sample_df, "test_table", dry_run=True)
+    read_df = sink.read(
+        "events", partition_filter={"date": datetime.date(2025, 1, 1)}
+    ).collect()
+    assert len(read_df) == 2
+    assert all(d == datetime.date(2025, 1, 1) for d in read_df["date"].to_list())
 
-        assert plan.table_name == "test_table"
-        assert plan.rows_to_write == 3
 
-        # Should not actually create the table
-        assert sink.exists("test_table") is False
+# Exists tests
 
-    def test_dry_run_shows_partition_operations(
-        self, sink: Sink, partitioned_df: pl.DataFrame
-    ):
-        """dry_run shows planned partition operations."""
-        plan = sink.write(partitioned_df, "events", partition_by=["date"], dry_run=True)
 
-        assert len(plan.partitions_affected) == 2
-        assert all(op == "create" for op in plan.partition_operations.values())
+def test_exists_false_for_missing(sink: Sink):
+    """exists() returns False for non-existent table."""
+    assert sink.exists("nonexistent") is False
+
+
+def test_exists_true_after_write(sink: Sink, sample_df: pl.DataFrame):
+    """exists() returns True after writing."""
+    sink.write(sample_df, "test_table")
+    assert sink.exists("test_table") is True
+
+
+# Partition tests
+
+
+def test_list_partitions_empty_for_non_partitioned(sink: Sink, sample_df: pl.DataFrame):
+    """list_partitions() returns empty for non-partitioned table."""
+    sink.write(sample_df, "test_table")
+    assert sink.list_partitions("test_table") == []
+
+
+def test_list_partitions_returns_hive_style(sink: Sink, partitioned_df: pl.DataFrame):
+    """list_partitions() returns Hive-style partition paths."""
+    sink.write(partitioned_df, "events", partition_by=["date"])
+
+    partitions = sink.list_partitions("events")
+    assert len(partitions) == 2
+    assert all("date=" in p for p in partitions)
+    assert "date=2025-01-01" in partitions
+    assert "date=2025-01-02" in partitions
+
+
+def test_delete_partitions(sink: Sink, partitioned_df: pl.DataFrame):
+    """delete_partitions() removes specified partitions."""
+    sink.write(partitioned_df, "events", partition_by=["date"])
+
+    sink.delete_partitions("events", ["date=2025-01-01"])
+
+    partitions = sink.list_partitions("events")
+    assert partitions == ["date=2025-01-02"]
+
+    read_df = sink.read("events").collect()
+    assert len(read_df) == 2
+    assert all(d == datetime.date(2025, 1, 2) for d in read_df["date"].to_list())
+
+
+# Partition mode tests
+
+
+def test_append_mode_adds_data(sink: Sink):
+    """Append mode adds data to existing partitions."""
+    df1 = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+        }
+    )
+    df2 = pl.DataFrame(
+        {
+            "id": [3, 4],
+            "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+        }
+    )
+
+    sink.write(df1, "events", partition_by=["date"], partition_mode="append")
+    sink.write(df2, "events", partition_by=["date"], partition_mode="append")
+
+    read_df = sink.read("events").collect()
+    assert len(read_df) == 4
+    assert set(read_df["id"].to_list()) == {1, 2, 3, 4}
+
+
+def test_overwrite_mode_replaces_partition(sink: Sink):
+    """Overwrite mode replaces data in existing partitions."""
+    df1 = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+        }
+    )
+    df2 = pl.DataFrame(
+        {
+            "id": [3, 4],
+            "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+        }
+    )
+
+    sink.write(df1, "events", partition_by=["date"], partition_mode="append")
+    sink.write(df2, "events", partition_by=["date"], partition_mode="overwrite")
+
+    read_df = sink.read("events").collect()
+    assert len(read_df) == 2
+    assert set(read_df["id"].to_list()) == {3, 4}
+
+
+# Dry run tests
+
+
+def test_dry_run_returns_plan(sink: Sink, sample_df: pl.DataFrame):
+    """dry_run=True returns plan without writing."""
+    plan = sink.write(sample_df, "test_table", dry_run=True)
+
+    assert plan.table_name == "test_table"
+    assert plan.rows_to_write == 3
+    assert sink.exists("test_table") is False
+
+
+def test_dry_run_shows_partition_operations(sink: Sink, partitioned_df: pl.DataFrame):
+    """dry_run shows planned partition operations."""
+    plan = sink.write(partitioned_df, "events", partition_by=["date"], dry_run=True)
+
+    assert len(plan.partitions_affected) == 2
+    assert all(op == "create" for op in plan.partition_operations.values())
