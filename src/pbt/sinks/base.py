@@ -24,7 +24,9 @@ class DryRunPlan:
     table_name: str
     rows_to_write: int
     partitions_affected: list[str] = field(default_factory=list)
-    partition_operations: dict[str, str] = field(default_factory=dict)  # partition -> operation
+    partition_operations: dict[str, str] = field(
+        default_factory=dict
+    )  # partition -> operation
     destination: str = ""
 
 
