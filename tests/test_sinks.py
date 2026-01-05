@@ -162,23 +162,13 @@ def test_write_read_various_schemas(sink: Sink, df: pl.DataFrame):
 
 
 @pytest.mark.parametrize(
-    "df,_new_df,partition_by,_expected_partitions,_filter,_expected_values",
-    WORKFLOW_CASES,
+    "df,_,partition_by,__,___,____", WORKFLOW_CASES
 )
-def test_partitioning_configurations(
-    sink: Sink,
-    df: pl.DataFrame,
-    _new_df: pl.DataFrame,
-    partition_by: list[str],
-    _expected_partitions: int,
-    _filter: dict,
-    _expected_values: set,
-):
+def test_partitioning_configurations(sink: Sink, df, _, partition_by, __, ___, ____):
     """Test various partitioning configurations."""
     sink.write(df, "partitioned", partition_by=partition_by)
 
     partitions = sink.list_partitions("partitioned")
-    # Count unique partition values in the initial df
     expected_partitions = len(df.select(partition_by).unique())
     assert len(partitions) == expected_partitions
 
@@ -215,30 +205,18 @@ def test_partition_modes(sink: Sink, mode: str, expected_rows: int, expected_ids
 
 
 @pytest.mark.parametrize(
-    "initial_df,new_df,partition_by,expected_partitions,_filter,_expected_values",
-    WORKFLOW_CASES,
+    "initial_df,new_df,partition_by,expected_partitions,_,__", WORKFLOW_CASES
 )
-def test_append_workflow(
-    sink: Sink,
-    initial_df: pl.DataFrame,
-    new_df: pl.DataFrame,
-    partition_by: list[str],
-    expected_partitions: int,
-    _filter: dict,
-    _expected_values: set,
-):
+def test_append_workflow(sink: Sink, initial_df, new_df, partition_by, expected_partitions, _, __):
     """Test sink-level append workflow with various partition types."""
-    initial_rows = len(initial_df)
-    new_rows = len(new_df)
-
     sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
     result1 = sink.read("events").collect()
-    assert len(result1) == initial_rows
+    assert len(result1) == len(initial_df)
 
     sink.write(new_df, "events", partition_by=partition_by, partition_mode="append")
 
     result2 = sink.read("events").collect()
-    assert len(result2) == initial_rows + new_rows
+    assert len(result2) == len(initial_df) + len(new_df)
     assert len(sink.list_partitions("events")) == expected_partitions
 
     all_ids = set(initial_df["id"].to_list() + new_df["id"].to_list())
@@ -246,23 +224,12 @@ def test_append_workflow(
 
 
 @pytest.mark.parametrize(
-    "initial_df,new_df,partition_by,_expected_partitions,filter_dict,expected_values",
-    WORKFLOW_CASES,
+    "initial_df,new_df,partition_by,_,filter_dict,expected_values", WORKFLOW_CASES
 )
-def test_overwrite_workflow(
-    sink: Sink,
-    initial_df: pl.DataFrame,
-    new_df: pl.DataFrame,
-    partition_by: list[str],
-    _expected_partitions: int,
-    filter_dict: dict,
-    expected_values: set,
-):
+def test_overwrite_workflow(sink: Sink, initial_df, new_df, partition_by, _, filter_dict, expected_values):
     """Test sink-level overwrite workflow with various partition types."""
     sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
-    sink.write(
-        new_df, "events", partition_by=partition_by, partition_mode="overwrite"
-    )
+    sink.write(new_df, "events", partition_by=partition_by, partition_mode="overwrite")
 
     overwritten = sink.read("events", partition_filter=filter_dict).collect()
     assert set(overwritten["value"].to_list()) == expected_values
@@ -434,3 +401,101 @@ def test_incremental_table_integration(tmp_path: Path, sink_type: str):
                 "events", partition_filter={"date": partition_date}
             ).collect()
             assert len(partition_data) == expected_count
+
+
+@pytest.mark.parametrize("sink_type", ["local", "duckdb"])
+def test_incremental_table_with_downstream(tmp_path: Path, sink_type: str):
+    """
+    Integration test: incremental_table feeding a downstream incremental_table.
+
+    Tests: source -> incremental_table -> incremental_table (aggregated)
+    Verifies incremental tables work correctly when chained.
+
+    Key behavior: Each incremental_table only processes NEW data since last run.
+    The downstream table aggregates only the new rows, not the full history.
+    """
+    with make_sink(tmp_path, sink_type) as sink:
+        data_file = tmp_path / "raw.parquet"
+        initial_data = pl.DataFrame({
+            "id": [1, 2, 3],
+            "timestamp": [
+                dt(2025, 1, 15, 10, 0),
+                dt(2025, 1, 15, 11, 0),
+                dt(2025, 1, 16, 10, 0),
+            ],
+            "amount": [100, 200, 300],
+        })
+        initial_data.write_parquet(data_file)
+
+        app = conf(root=tmp_path)
+
+        @app.source
+        def raw_transactions():
+            return pl.scan_parquet(data_file).with_columns(
+                pl.col("timestamp").dt.date().alias("date")
+            )
+
+        @app.incremental_table(
+            time_column="timestamp",
+            partition_by="date",
+            partition_mode="append",
+            sink=sink,
+        )
+        def transactions(raw_transactions):
+            """First incremental table - stores raw transactions."""
+            return raw_transactions
+
+        @app.incremental_table(
+            time_column="timestamp",
+            partition_by="date",
+            partition_mode="overwrite",
+            sink=sink,
+        )
+        def daily_totals(transactions):
+            """Second incremental table - aggregates only NEW rows by date."""
+            return transactions.group_by("date").agg(
+                pl.col("amount").sum().alias("total"),
+                pl.col("timestamp").max(),
+            )
+
+        # First run
+        app.run(silent=True)
+
+        # Check first incremental table
+        txns = sink.read("transactions").collect()
+        assert len(txns) == 3
+
+        # Check second incremental table (aggregates all 3 initial rows)
+        totals = sink.read("daily_totals").collect()
+        assert len(totals) == 2
+        assert totals.filter(pl.col("date") == date(2025, 1, 15))["total"][0] == 300
+        assert totals.filter(pl.col("date") == date(2025, 1, 16))["total"][0] == 300
+
+        # Add new data
+        new_data = pl.DataFrame({
+            "id": [4, 5],
+            "timestamp": [
+                dt(2025, 1, 16, 14, 0),
+                dt(2025, 1, 17, 10, 0),
+            ],
+            "amount": [400, 500],
+        })
+        pl.concat([initial_data, new_data]).write_parquet(data_file)
+
+        # Second run
+        app.run(silent=True)
+
+        # Check first incremental got new rows via append
+        txns2 = sink.read("transactions").collect()
+        assert len(txns2) == 5
+
+        # Check second incremental - only sees NEW data from this run
+        # With overwrite mode, each partition gets the aggregate of NEW rows only
+        totals2 = sink.read("daily_totals").collect()
+        assert len(totals2) == 3
+        # 2025-01-15: unchanged (no new data processed for that date)
+        assert totals2.filter(pl.col("date") == date(2025, 1, 15))["total"][0] == 300
+        # 2025-01-16: partition overwritten with only NEW row (400), not 300+400
+        assert totals2.filter(pl.col("date") == date(2025, 1, 16))["total"][0] == 400
+        # 2025-01-17: new partition from new row
+        assert totals2.filter(pl.col("date") == date(2025, 1, 17))["total"][0] == 500
