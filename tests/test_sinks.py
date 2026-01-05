@@ -43,43 +43,6 @@ SCHEMA_CASES = [
     ),
 ]
 
-# Partition configurations for testing various partition types
-PARTITION_CASES = [
-    pytest.param(
-        pl.DataFrame({
-            "id": [1, 2, 3, 4],
-            "date": [
-                datetime.date(2025, 1, 1),
-                datetime.date(2025, 1, 1),
-                datetime.date(2025, 1, 2),
-                datetime.date(2025, 1, 2),
-            ],
-        }),
-        ["date"],
-        2,
-        id="single_date_partition",
-    ),
-    pytest.param(
-        pl.DataFrame({
-            "id": [1, 2, 3, 4],
-            "year": [2024, 2024, 2025, 2025],
-            "month": [1, 2, 1, 2],
-        }),
-        ["year", "month"],
-        4,
-        id="two_column_partition",
-    ),
-    pytest.param(
-        pl.DataFrame({
-            "id": [1, 2, 3],
-            "category": ["a", "b", "c"],
-        }),
-        ["category"],
-        3,
-        id="string_partition",
-    ),
-]
-
 # Partition mode cases (append vs overwrite)
 PARTITION_MODE_CASES = [
     pytest.param("append", 4, {1, 2, 3, 4}, id="append_keeps_all"),
@@ -198,14 +161,25 @@ def test_write_read_various_schemas(sink: Sink, df: pl.DataFrame):
 # =============================================================================
 
 
-@pytest.mark.parametrize("df,partition_by,expected_partitions", PARTITION_CASES)
+@pytest.mark.parametrize(
+    "df,_new_df,partition_by,_expected_partitions,_filter,_expected_values",
+    WORKFLOW_CASES,
+)
 def test_partitioning_configurations(
-    sink: Sink, df: pl.DataFrame, partition_by: list[str], expected_partitions: int
+    sink: Sink,
+    df: pl.DataFrame,
+    _new_df: pl.DataFrame,
+    partition_by: list[str],
+    _expected_partitions: int,
+    _filter: dict,
+    _expected_values: set,
 ):
     """Test various partitioning configurations."""
     sink.write(df, "partitioned", partition_by=partition_by)
 
     partitions = sink.list_partitions("partitioned")
+    # Count unique partition values in the initial df
+    expected_partitions = len(df.select(partition_by).unique())
     assert len(partitions) == expected_partitions
 
     for col in partition_by:
