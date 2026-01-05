@@ -1,4 +1,5 @@
 """Test for incremental + partitioned append bug."""
+
 from datetime import date, datetime
 
 import polars as pl
@@ -20,15 +21,17 @@ def test_incremental_partitioned_append_no_duplicates(tmp_path):
 
     # Create sample data file with timestamps
     data_file = tmp_path / "events.parquet"
-    initial_data = pl.DataFrame({
-        "id": [1, 2, 3],
-        "timestamp": [
-            datetime(2025, 1, 15, 10, 0),
-            datetime(2025, 1, 15, 11, 0),
-            datetime(2025, 1, 16, 10, 0),
-        ],
-        "value": ["a", "b", "c"],
-    })
+    initial_data = pl.DataFrame(
+        {
+            "id": [1, 2, 3],
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0),
+                datetime(2025, 1, 15, 11, 0),
+                datetime(2025, 1, 16, 10, 0),
+            ],
+            "value": ["a", "b", "c"],
+        }
+    )
     initial_data.write_parquet(data_file)
 
     # Setup PBT app
@@ -59,17 +62,21 @@ def test_incremental_partitioned_append_no_duplicates(tmp_path):
 
     # Verify partitions created (2 dates: 2025-01-15 and 2025-01-16)
     partitions1 = sink.list_partitions("events")
-    assert len(partitions1) == 2, f"Expected 2 partitions after first run, got {len(partitions1)}"
+    assert (
+        len(partitions1) == 2
+    ), f"Expected 2 partitions after first run, got {len(partitions1)}"
 
     # Add more data with newer timestamps (one existing date, one new date)
-    new_data = pl.DataFrame({
-        "id": [4, 5],
-        "timestamp": [
-            datetime(2025, 1, 16, 12, 0),  # Same date as id=3
-            datetime(2025, 1, 17, 10, 0),  # New date
-        ],
-        "value": ["d", "e"],
-    })
+    new_data = pl.DataFrame(
+        {
+            "id": [4, 5],
+            "timestamp": [
+                datetime(2025, 1, 16, 12, 0),  # Same date as id=3
+                datetime(2025, 1, 17, 10, 0),  # New date
+            ],
+            "value": ["d", "e"],
+        }
+    )
     combined = pl.concat([initial_data, new_data])
     combined.write_parquet(data_file)
 
@@ -82,14 +89,24 @@ def test_incremental_partitioned_append_no_duplicates(tmp_path):
 
     # Verify new partition was created (now 3 dates)
     partitions2 = sink.list_partitions("events")
-    assert len(partitions2) == 3, f"Expected 3 partitions after second run, got {len(partitions2)}"
+    assert (
+        len(partitions2) == 3
+    ), f"Expected 3 partitions after second run, got {len(partitions2)}"
 
     # Verify the new date partition exists
-    assert any("2025-01-17" in p for p in partitions2), "Expected partition for 2025-01-17"
+    assert any(
+        "2025-01-17" in p for p in partitions2
+    ), "Expected partition for 2025-01-17"
 
     # Verify row counts per partition
-    for partition_date, expected_count in [(date(2025, 1, 15), 2), (date(2025, 1, 16), 2), (date(2025, 1, 17), 1)]:
-        partition_data = sink.read("events", partition_filter={"date": partition_date}).collect()
-        assert len(partition_data) == expected_count, (
-            f"Expected {expected_count} rows for {partition_date}, got {len(partition_data)}"
-        )
+    for partition_date, expected_count in [
+        (date(2025, 1, 15), 2),
+        (date(2025, 1, 16), 2),
+        (date(2025, 1, 17), 1),
+    ]:
+        partition_data = sink.read(
+            "events", partition_filter={"date": partition_date}
+        ).collect()
+        assert (
+            len(partition_data) == expected_count
+        ), f"Expected {expected_count} rows for {partition_date}, got {len(partition_data)}"
