@@ -1,11 +1,13 @@
 """General sink tests that run against all sink implementations."""
 
 import datetime
+from datetime import date, datetime as dt
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+from pbt import conf
 from pbt.sinks import DuckDBSink, LocalSink, Sink
 
 
@@ -424,3 +426,113 @@ def test_dry_run_shows_partition_operations(sink: Sink):
 
     assert len(plan.partitions_affected) == 2
     assert all(op == "create" for op in plan.partition_operations.values())
+
+
+# =============================================================================
+# Integration tests with PBT incremental_table decorator
+# =============================================================================
+
+
+@pytest.fixture
+def make_sink(tmp_path: Path):
+    """Factory fixture that creates sinks for integration tests."""
+    sinks = []
+
+    def _make(sink_type: str) -> Sink:
+        if sink_type == "local":
+            sink = LocalSink(path=tmp_path / "output")
+        else:
+            sink = DuckDBSink(path=str(tmp_path / "test.db"))
+        sinks.append(sink)
+        return sink
+
+    yield _make
+
+    for s in sinks:
+        if hasattr(s, "close"):
+            s.close()
+
+
+@pytest.mark.parametrize("sink_type", ["local", "duckdb"])
+def test_incremental_table_with_sink(tmp_path: Path, make_sink, sink_type: str):
+    """
+    Integration test: incremental_table decorator with various sink types.
+
+    This tests the REAL incremental_table workflow, not just sink operations.
+    Verifies that the full PBT pipeline works with DuckDB sink.
+    """
+    sink = make_sink(sink_type)
+
+    # Create sample data file with timestamps
+    data_file = tmp_path / "events.parquet"
+    initial_data = pl.DataFrame({
+        "id": [1, 2, 3],
+        "timestamp": [
+            dt(2025, 1, 15, 10, 0),
+            dt(2025, 1, 15, 11, 0),
+            dt(2025, 1, 16, 10, 0),
+        ],
+        "value": ["a", "b", "c"],
+    })
+    initial_data.write_parquet(data_file)
+
+    # Setup PBT app
+    app = conf(root=tmp_path)
+
+    @app.source
+    def raw_events():
+        return pl.scan_parquet(data_file).with_columns(
+            pl.col("timestamp").dt.date().alias("date")
+        )
+
+    @app.incremental_table(
+        time_column="timestamp",
+        partition_by="date",
+        partition_mode="append",
+        sink=sink,
+    )
+    def events(raw_events):
+        return raw_events
+
+    # First run: should write 3 rows
+    app.run(silent=True)
+
+    result1 = sink.read("events").collect()
+    assert len(result1) == 3, f"Expected 3 rows after first run, got {len(result1)}"
+
+    partitions1 = sink.list_partitions("events")
+    assert len(partitions1) == 2, f"Expected 2 partitions, got {len(partitions1)}"
+
+    # Add more data with newer timestamps
+    new_data = pl.DataFrame({
+        "id": [4, 5],
+        "timestamp": [
+            dt(2025, 1, 16, 12, 0),  # Same date as id=3
+            dt(2025, 1, 17, 10, 0),  # New date
+        ],
+        "value": ["d", "e"],
+    })
+    combined = pl.concat([initial_data, new_data])
+    combined.write_parquet(data_file)
+
+    # Second run: should append only 2 new rows
+    app.run(silent=True)
+
+    result2 = sink.read("events").collect()
+    assert len(result2) == 5, f"Expected 5 rows after second run, got {len(result2)}"
+
+    partitions2 = sink.list_partitions("events")
+    assert len(partitions2) == 3, f"Expected 3 partitions, got {len(partitions2)}"
+
+    # Verify per-partition counts
+    for partition_date, expected_count in [
+        (date(2025, 1, 15), 2),
+        (date(2025, 1, 16), 2),
+        (date(2025, 1, 17), 1),
+    ]:
+        partition_data = sink.read(
+            "events", partition_filter={"date": partition_date}
+        ).collect()
+        assert len(partition_data) == expected_count, (
+            f"Expected {expected_count} rows for {partition_date}"
+        )
