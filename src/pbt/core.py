@@ -1,14 +1,18 @@
 """Core PBT functionality: conf, decorators, and execution"""
 
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import polars as pl
 
-from pbt.exceptions import PartitionSchemaError
+from pbt.exceptions import (
+    PartitionSchemaError,
+    CircularDependencyError,
+    IncrementalConfigError,
+)
 from pbt.utils import coerce_datetime, parse_timestamp_value
 from pbt.meta import SchemaManager, SchemaChangeError, TableMeta
 
@@ -147,6 +151,7 @@ class PBTApp:
         unique_key: Optional[str | list[str]] = None,
         partition_by: Optional[str | list[str]] = None,
         partition_mode: str = "append",
+        lookback: Optional[timedelta] = None,
         sink: Optional["Sink"] = None,
     ) -> Model:
         """Decorator for materialized tables - writes to sink.
@@ -158,6 +163,7 @@ class PBTApp:
             unique_key: Column(s) for deduplication (future use)
             partition_by: Column(s) to partition by (Hive-style)
             partition_mode: "append" or "overwrite" for partition handling
+            lookback: Lookback window for late-arriving data (incremental tables only)
             sink: Sink to write to (defaults to LocalSink at root/output)
         """
 
@@ -165,7 +171,11 @@ class PBTApp:
             # Normalize partition_by to list
             pb = None
             if partition_by is not None:
-                pb = [partition_by] if isinstance(partition_by, str) else list(partition_by)
+                pb = (
+                    [partition_by]
+                    if isinstance(partition_by, str)
+                    else list(partition_by)
+                )
 
             config = {
                 "incremental": incremental,
@@ -173,6 +183,7 @@ class PBTApp:
                 "unique_key": unique_key,
                 "partition_by": pb,
                 "partition_mode": partition_mode,
+                "lookback": lookback,
                 "sink": sink,
             }
             model = Model(f, self, "table", config)
@@ -194,17 +205,24 @@ class PBTApp:
         *,
         time_column: str,
         unique_key: Optional[str | list[str]] = None,
-        partition_by: Optional[str | list[str]] = None,
+        partition_by: str | list[str],
         partition_mode: str = "append",
+        lookback: Optional[timedelta] = None,
         sink: Optional["Sink"] = None,
     ) -> Model:
         """Sugar for incremental tables that auto-applies incremental_filter.
 
+        Incremental tables MUST be partitioned by date (derived from time_column).
+        This ensures clean lookback semantics and prevents data duplication.
+
         Args:
             time_column: Column to use for incremental watermark (required)
             unique_key: Column(s) for deduplication (future use)
-            partition_by: Column(s) to partition by (Hive-style)
+            partition_by: Column(s) to partition by (required, must include a Date column)
             partition_mode: "append" or "overwrite" for partition handling
+            lookback: Optional lookback window to catch late-arriving data.
+                      When set, reprocesses data from (last_max_value - lookback).
+                      Partitions within the lookback window are overwritten.
             sink: Sink to write to (defaults to LocalSink at root/output)
         """
 
@@ -215,6 +233,7 @@ class PBTApp:
                 unique_key=unique_key,
                 partition_by=partition_by,
                 partition_mode=partition_mode,
+                lookback=lookback,
                 sink=sink,
             )
 
@@ -286,21 +305,40 @@ class PBTApp:
         return dag
 
     def topological_sort(self) -> list[str]:
-        """Return models in execution order"""
+        """Return models in execution order.
+
+        Raises:
+            CircularDependencyError: If a cycle is detected in the dependency graph.
+        """
         dag = self.build_dag()
         visited = set()
+        in_progress = set()  # Track nodes currently being visited (on the stack)
         result = []
 
-        def visit(node: str):
+        def visit(node: str, path: list[str]):
             if node in visited:
                 return
-            visited.add(node)
+            if node in in_progress:
+                # Found a cycle - build the cycle path for error message
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:] + [node]
+                raise CircularDependencyError(
+                    f"Circular dependency detected: {' -> '.join(cycle)}"
+                )
+
+            in_progress.add(node)
+            path.append(node)
+
             for dep in dag.get(node, []):
-                visit(dep)
+                visit(dep, path)
+
+            path.pop()
+            in_progress.remove(node)
+            visited.add(node)
             result.append(node)
 
         for node in dag:
-            visit(node)
+            visit(node, [])
 
         return result
 
@@ -367,6 +405,7 @@ class PBTApp:
                             "schema_manager": self.schema_manager,
                             "full_refresh": full_refresh,
                             "reprocess_range": self._rerun_ranges.get(model_name),
+                            "lookback": config.get("lookback"),
                         }
                     kwargs[param_name] = df
 
@@ -399,12 +438,25 @@ class PBTApp:
 
                 # Check for partition schema changes (unless full_refresh)
                 if not full_refresh:
-                    self._check_partition_schema(model_name, partition_by, partition_mode)
+                    self._check_partition_schema(
+                        model_name, partition_by, partition_mode
+                    )
 
                 collected = result.collect()
 
                 if debug and not silent:
                     print(f"  - Collected {len(collected)} rows")
+
+                # Validate time_column for incremental tables
+                if config.get("incremental") and config.get("time_column"):
+                    self._validate_time_column(
+                        model_name, collected.schema, config["time_column"]
+                    )
+                    # Also validate date partition requirement for incremental tables
+                    if partition_by:
+                        self._validate_date_partition(
+                            model_name, collected.schema, partition_by
+                        )
 
                 # Check for schema changes before writing
                 current_schema = collected.schema
@@ -425,15 +477,28 @@ class PBTApp:
                 # Handle incremental merge with existing data
                 if config.get("incremental") and not full_refresh:
                     collected = self._apply_incremental_merge(
-                        model_name, collected, config, sink, reprocess_range, debug, silent
+                        model_name,
+                        collected,
+                        config,
+                        sink,
+                        reprocess_range,
+                        debug,
+                        silent,
                     )
+
+                # Determine effective partition mode for write
+                # When lookback is set, use overwrite mode for affected partitions
+                # to avoid duplicating data in the lookback window
+                effective_partition_mode = partition_mode
+                if config.get("lookback") and partition_by:
+                    effective_partition_mode = "overwrite"
 
                 # Write via sink
                 write_result = sink.write(
                     df=collected,
                     name=model_name,
                     partition_by=partition_by,
-                    partition_mode=partition_mode,
+                    partition_mode=effective_partition_mode,
                     dry_run=dry_run,
                 )
 
@@ -500,6 +565,54 @@ class PBTApp:
                     f"  Current: partition_mode={partition_mode}\n"
                     f"Run with full_refresh=True to confirm this change."
                 )
+
+    def _validate_time_column(
+        self,
+        model_name: str,
+        schema: dict[str, pl.DataType],
+        time_column: str,
+    ) -> None:
+        """Validate that time_column exists and is a datetime-like type."""
+        if time_column not in schema:
+            available = list(schema.keys())
+            raise IncrementalConfigError(
+                f"time_column '{time_column}' not found in '{model_name}'.\n"
+                f"  Available columns: {available}"
+            )
+
+        col_type = schema[time_column]
+        # Check for datetime-like types
+        valid_types = (pl.Datetime, pl.Date)
+        if not isinstance(col_type, valid_types):
+            raise IncrementalConfigError(
+                f"time_column '{time_column}' in '{model_name}' must be Datetime or Date type.\n"
+                f"  Got: {col_type}\n"
+                f"  Hint: Use .cast(pl.Datetime) or .str.to_datetime() to convert."
+            )
+
+    def _validate_date_partition(
+        self,
+        model_name: str,
+        schema: dict[str, pl.DataType],
+        partition_by: list[str],
+    ) -> None:
+        """Validate that at least one partition column is a Date type."""
+        date_partitions = [
+            col
+            for col in partition_by
+            if col in schema and isinstance(schema[col], pl.Date)
+        ]
+
+        if not date_partitions:
+            partition_types = {
+                col: str(schema.get(col, "missing")) for col in partition_by
+            }
+            raise IncrementalConfigError(
+                f"Incremental table '{model_name}' requires at least one Date partition.\n"
+                f"  partition_by columns: {partition_types}\n"
+                f"  Hint: Add a date column derived from time_column:\n"
+                f"    .with_columns(pl.col('timestamp').dt.date().alias('date'))"
+            )
 
     def _apply_incremental_merge(
         self,
