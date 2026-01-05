@@ -1,4 +1,5 @@
 """Tests for schema change detection."""
+
 import polars as pl
 import pytest
 

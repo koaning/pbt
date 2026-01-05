@@ -1,0 +1,501 @@
+"""General sink tests that run against all sink implementations."""
+
+import datetime
+from contextlib import contextmanager
+from datetime import date, datetime as dt
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from pbt import conf
+from pbt.sinks import DuckDBSink, LocalSink, Sink
+
+
+# =============================================================================
+# Test configurations - all test data defined here
+# =============================================================================
+
+# Various DataFrame schemas for basic read/write tests
+SCHEMA_CASES = [
+    pytest.param(
+        pl.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]}),
+        id="int_and_str",
+    ),
+    pytest.param(
+        pl.DataFrame({"x": [1.5, 2.5, 3.5], "y": [True, False, True]}),
+        id="float_and_bool",
+    ),
+    pytest.param(
+        pl.DataFrame({
+            "dt": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 2)],
+            "val": [100, 200],
+        }),
+        id="date_and_int",
+    ),
+    pytest.param(
+        pl.DataFrame({"single": [42]}),
+        id="single_row",
+    ),
+    pytest.param(
+        pl.DataFrame({"a": list(range(1000)), "b": list(range(1000))}),
+        id="large_1000_rows",
+    ),
+]
+
+# Partition mode cases (append vs overwrite)
+PARTITION_MODE_CASES = [
+    pytest.param("append", 4, {1, 2, 3, 4}, id="append_keeps_all"),
+    pytest.param("overwrite", 2, {3, 4}, id="overwrite_replaces"),
+]
+
+# Workflow cases for sink-level partition tests (append + overwrite)
+# Each case: (initial_df, new_df, partition_by, expected_partitions_after_append,
+#             overwrite_filter, expected_overwrite_values)
+WORKFLOW_CASES = [
+    pytest.param(
+        # initial data
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "date": [
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 16),
+            ],
+            "value": [10, 20, 30],
+        }),
+        # new data (overlaps on 2025-01-16, adds 2025-01-17)
+        pl.DataFrame({
+            "id": [4, 5],
+            "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 17)],
+            "value": [400, 500],
+        }),
+        ["date"],
+        3,  # expected partitions after append
+        {"date": datetime.date(2025, 1, 16)},  # filter for overwrite test
+        {400},  # expected values after overwrite (only new data in that partition)
+        id="date_partition",
+    ),
+    pytest.param(
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "year": [2024, 2024, 2025],
+            "month": [12, 12, 1],
+            "value": [10, 20, 30],
+        }),
+        pl.DataFrame({
+            "id": [4, 5],
+            "year": [2025, 2025],
+            "month": [1, 2],
+            "value": [400, 500],
+        }),
+        ["year", "month"],
+        3,
+        {"year": 2025, "month": 1},
+        {400},
+        id="year_month_partition",
+    ),
+    pytest.param(
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "category": ["users", "users", "orders"],
+            "value": [10, 20, 30],
+        }),
+        pl.DataFrame({
+            "id": [4, 5],
+            "category": ["orders", "products"],
+            "value": [400, 500],
+        }),
+        ["category"],
+        3,
+        {"category": "orders"},
+        {400},
+        id="string_partition",
+    ),
+]
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+
+@contextmanager
+def make_sink(tmp_path: Path, sink_type: str):
+    """Context manager that creates and cleans up sinks."""
+    if sink_type == "local":
+        sink = LocalSink(path=tmp_path / "output")
+        yield sink
+    else:
+        sink = DuckDBSink(path=str(tmp_path / "test.db"))
+        try:
+            yield sink
+        finally:
+            sink.close()
+
+
+@pytest.fixture(params=["local", "duckdb"])
+def sink(request, tmp_path: Path) -> Sink:
+    """Parametrized fixture that yields each sink implementation."""
+    with make_sink(tmp_path, request.param) as s:
+        yield s
+
+
+# =============================================================================
+# Basic read/write tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("df", SCHEMA_CASES)
+def test_write_read_various_schemas(sink: Sink, df: pl.DataFrame):
+    """Write and read back DataFrames with various schemas."""
+    sink.write(df, "test_table")
+    result = sink.read("test_table").collect()
+
+    assert len(result) == len(df)
+    assert set(result.columns) == set(df.columns)
+
+
+# =============================================================================
+# Partition tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "df,_,partition_by,__,___,____", WORKFLOW_CASES
+)
+def test_partitioning_configurations(sink: Sink, df, _, partition_by, __, ___, ____):
+    """Test various partitioning configurations."""
+    sink.write(df, "partitioned", partition_by=partition_by)
+
+    partitions = sink.list_partitions("partitioned")
+    expected_partitions = len(df.select(partition_by).unique())
+    assert len(partitions) == expected_partitions
+
+    for col in partition_by:
+        assert all(f"{col}=" in p for p in partitions)
+
+    result = sink.read("partitioned").collect()
+    assert len(result) == len(df)
+
+
+@pytest.mark.parametrize("mode,expected_rows,expected_ids", PARTITION_MODE_CASES)
+def test_partition_modes(sink: Sink, mode: str, expected_rows: int, expected_ids: set):
+    """Test append vs overwrite partition modes."""
+    df1 = pl.DataFrame({
+        "id": [1, 2],
+        "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+    })
+    df2 = pl.DataFrame({
+        "id": [3, 4],
+        "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 1)],
+    })
+
+    sink.write(df1, "events", partition_by=["date"], partition_mode="append")
+    sink.write(df2, "events", partition_by=["date"], partition_mode=mode)
+
+    result = sink.read("events").collect()
+    assert len(result) == expected_rows
+    assert set(result["id"].to_list()) == expected_ids
+
+
+# =============================================================================
+# Sink-level append/overwrite workflow tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "initial_df,new_df,partition_by,expected_partitions,_,__", WORKFLOW_CASES
+)
+def test_append_workflow(sink: Sink, initial_df, new_df, partition_by, expected_partitions, _, __):
+    """Test sink-level append workflow with various partition types."""
+    sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
+    result1 = sink.read("events").collect()
+    assert len(result1) == len(initial_df)
+
+    sink.write(new_df, "events", partition_by=partition_by, partition_mode="append")
+
+    result2 = sink.read("events").collect()
+    assert len(result2) == len(initial_df) + len(new_df)
+    assert len(sink.list_partitions("events")) == expected_partitions
+
+    all_ids = set(initial_df["id"].to_list() + new_df["id"].to_list())
+    assert set(result2["id"].to_list()) == all_ids
+
+
+@pytest.mark.parametrize(
+    "initial_df,new_df,partition_by,_,filter_dict,expected_values", WORKFLOW_CASES
+)
+def test_overwrite_workflow(sink: Sink, initial_df, new_df, partition_by, _, filter_dict, expected_values):
+    """Test sink-level overwrite workflow with various partition types."""
+    sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
+    sink.write(new_df, "events", partition_by=partition_by, partition_mode="overwrite")
+
+    overwritten = sink.read("events", partition_filter=filter_dict).collect()
+    assert set(overwritten["value"].to_list()) == expected_values
+
+
+# =============================================================================
+# Core functionality tests
+# =============================================================================
+
+
+def test_exists_false_for_missing(sink: Sink):
+    """exists() returns False for non-existent table."""
+    assert sink.exists("nonexistent") is False
+
+
+def test_exists_true_after_write(sink: Sink):
+    """exists() returns True after writing."""
+    df = pl.DataFrame({"id": [1, 2, 3]})
+    sink.write(df, "test_table")
+    assert sink.exists("test_table") is True
+
+
+def test_list_partitions_empty_for_non_partitioned(sink: Sink):
+    """list_partitions() returns empty for non-partitioned table."""
+    df = pl.DataFrame({"id": [1, 2, 3]})
+    sink.write(df, "test_table")
+    assert sink.list_partitions("test_table") == []
+
+
+def test_delete_partitions(sink: Sink):
+    """delete_partitions() removes specified partitions."""
+    df = pl.DataFrame({
+        "id": [1, 2, 3, 4],
+        "date": [
+            datetime.date(2025, 1, 1),
+            datetime.date(2025, 1, 1),
+            datetime.date(2025, 1, 2),
+            datetime.date(2025, 1, 2),
+        ],
+    })
+    sink.write(df, "events", partition_by=["date"])
+    sink.delete_partitions("events", ["date=2025-01-01"])
+
+    partitions = sink.list_partitions("events")
+    assert partitions == ["date=2025-01-02"]
+
+    result = sink.read("events").collect()
+    assert len(result) == 2
+
+
+def test_partition_filter_read(sink: Sink):
+    """Read with partition filter returns only matching rows."""
+    df = pl.DataFrame({
+        "id": [1, 2, 3, 4],
+        "date": [
+            datetime.date(2025, 1, 1),
+            datetime.date(2025, 1, 1),
+            datetime.date(2025, 1, 2),
+            datetime.date(2025, 1, 2),
+        ],
+    })
+    sink.write(df, "events", partition_by=["date"])
+
+    result = sink.read(
+        "events", partition_filter={"date": datetime.date(2025, 1, 1)}
+    ).collect()
+    assert len(result) == 2
+    assert all(d == datetime.date(2025, 1, 1) for d in result["date"].to_list())
+
+
+def test_dry_run_returns_plan_without_writing(sink: Sink):
+    """dry_run=True returns plan without actually writing."""
+    df = pl.DataFrame({"id": [1, 2, 3]})
+    plan = sink.write(df, "test_table", dry_run=True)
+
+    assert plan.table_name == "test_table"
+    assert plan.rows_to_write == 3
+    assert sink.exists("test_table") is False
+
+
+def test_dry_run_shows_partition_operations(sink: Sink):
+    """dry_run shows planned partition operations."""
+    df = pl.DataFrame({
+        "id": [1, 2],
+        "date": [datetime.date(2025, 1, 1), datetime.date(2025, 1, 2)],
+    })
+    plan = sink.write(df, "events", partition_by=["date"], dry_run=True)
+
+    assert len(plan.partitions_affected) == 2
+    assert all(op == "create" for op in plan.partition_operations.values())
+
+
+# =============================================================================
+# Integration tests with PBT incremental_table decorator
+# =============================================================================
+
+
+@pytest.mark.parametrize("sink_type", ["local", "duckdb"])
+def test_incremental_table_integration(tmp_path: Path, sink_type: str):
+    """
+    Integration test: incremental_table decorator with various sink types.
+
+    This tests the REAL incremental_table workflow, not just sink operations.
+    Note: incremental_table requires a Date partition column.
+    """
+    with make_sink(tmp_path, sink_type) as sink:
+        data_file = tmp_path / "events.parquet"
+        initial_data = pl.DataFrame({
+            "id": [1, 2, 3],
+            "timestamp": [
+                dt(2025, 1, 15, 10, 0),
+                dt(2025, 1, 15, 11, 0),
+                dt(2025, 1, 16, 10, 0),
+            ],
+            "value": ["a", "b", "c"],
+        })
+        initial_data.write_parquet(data_file)
+
+        app = conf(root=tmp_path)
+
+        @app.source
+        def raw_events():
+            return pl.scan_parquet(data_file).with_columns(
+                pl.col("timestamp").dt.date().alias("date")
+            )
+
+        @app.incremental_table(
+            time_column="timestamp",
+            partition_by="date",
+            partition_mode="append",
+            sink=sink,
+        )
+        def events(raw_events):
+            return raw_events
+
+        # First run
+        app.run(silent=True)
+
+        result1 = sink.read("events").collect()
+        assert len(result1) == 3
+        assert len(sink.list_partitions("events")) == 2
+
+        # Add more data
+        new_data = pl.DataFrame({
+            "id": [4, 5],
+            "timestamp": [
+                dt(2025, 1, 16, 12, 0),
+                dt(2025, 1, 17, 10, 0),
+            ],
+            "value": ["d", "e"],
+        })
+        combined = pl.concat([initial_data, new_data])
+        combined.write_parquet(data_file)
+
+        # Second run
+        app.run(silent=True)
+
+        result2 = sink.read("events").collect()
+        assert len(result2) == 5
+        assert len(sink.list_partitions("events")) == 3
+
+        # Verify per-partition counts
+        for partition_date, expected_count in [
+            (date(2025, 1, 15), 2),
+            (date(2025, 1, 16), 2),
+            (date(2025, 1, 17), 1),
+        ]:
+            partition_data = sink.read(
+                "events", partition_filter={"date": partition_date}
+            ).collect()
+            assert len(partition_data) == expected_count
+
+
+@pytest.mark.parametrize("sink_type", ["local", "duckdb"])
+def test_incremental_table_with_downstream(tmp_path: Path, sink_type: str):
+    """
+    Integration test: incremental_table feeding a downstream incremental_table.
+
+    Tests: source -> incremental_table -> incremental_table (aggregated)
+    Verifies incremental tables work correctly when chained.
+
+    Key behavior: Each incremental_table only processes NEW data since last run.
+    The downstream table aggregates only the new rows, not the full history.
+    """
+    with make_sink(tmp_path, sink_type) as sink:
+        data_file = tmp_path / "raw.parquet"
+        initial_data = pl.DataFrame({
+            "id": [1, 2, 3],
+            "timestamp": [
+                dt(2025, 1, 15, 10, 0),
+                dt(2025, 1, 15, 11, 0),
+                dt(2025, 1, 16, 10, 0),
+            ],
+            "amount": [100, 200, 300],
+        })
+        initial_data.write_parquet(data_file)
+
+        app = conf(root=tmp_path)
+
+        @app.source
+        def raw_transactions():
+            return pl.scan_parquet(data_file).with_columns(
+                pl.col("timestamp").dt.date().alias("date")
+            )
+
+        @app.incremental_table(
+            time_column="timestamp",
+            partition_by="date",
+            partition_mode="append",
+            sink=sink,
+        )
+        def transactions(raw_transactions):
+            """First incremental table - stores raw transactions."""
+            return raw_transactions
+
+        @app.incremental_table(
+            time_column="timestamp",
+            partition_by="date",
+            partition_mode="overwrite",
+            sink=sink,
+        )
+        def daily_totals(transactions):
+            """Second incremental table - aggregates only NEW rows by date."""
+            return transactions.group_by("date").agg(
+                pl.col("amount").sum().alias("total"),
+                pl.col("timestamp").max(),
+            )
+
+        # First run
+        app.run(silent=True)
+
+        # Check first incremental table
+        txns = sink.read("transactions").collect()
+        assert len(txns) == 3
+
+        # Check second incremental table (aggregates all 3 initial rows)
+        totals = sink.read("daily_totals").collect()
+        assert len(totals) == 2
+        assert totals.filter(pl.col("date") == date(2025, 1, 15))["total"][0] == 300
+        assert totals.filter(pl.col("date") == date(2025, 1, 16))["total"][0] == 300
+
+        # Add new data
+        new_data = pl.DataFrame({
+            "id": [4, 5],
+            "timestamp": [
+                dt(2025, 1, 16, 14, 0),
+                dt(2025, 1, 17, 10, 0),
+            ],
+            "amount": [400, 500],
+        })
+        pl.concat([initial_data, new_data]).write_parquet(data_file)
+
+        # Second run
+        app.run(silent=True)
+
+        # Check first incremental got new rows via append
+        txns2 = sink.read("transactions").collect()
+        assert len(txns2) == 5
+
+        # Check second incremental - only sees NEW data from this run
+        # With overwrite mode, each partition gets the aggregate of NEW rows only
+        totals2 = sink.read("daily_totals").collect()
+        assert len(totals2) == 3
+        # 2025-01-15: unchanged (no new data processed for that date)
+        assert totals2.filter(pl.col("date") == date(2025, 1, 15))["total"][0] == 300
+        # 2025-01-16: partition overwritten with only NEW row (400), not 300+400
+        assert totals2.filter(pl.col("date") == date(2025, 1, 16))["total"][0] == 400
+        # 2025-01-17: new partition from new row
+        assert totals2.filter(pl.col("date") == date(2025, 1, 17))["total"][0] == 500

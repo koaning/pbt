@@ -56,7 +56,9 @@ class LocalSink(Sink):
             WriteResult on actual write, DryRunPlan on dry_run=True
         """
         if partition_by:
-            return self._write_partitioned(df, name, partition_by, partition_mode, dry_run)
+            return self._write_partitioned(
+                df, name, partition_by, partition_mode, dry_run
+            )
         else:
             return self._write_single(df, name, dry_run)
 

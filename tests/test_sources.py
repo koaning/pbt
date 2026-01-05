@@ -1,11 +1,11 @@
 """Test that all sources return true LazyFrames."""
+
 import os
 from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 import polars as pl
-import pytest
 
 from pbt.sources import duckdb_scan
 

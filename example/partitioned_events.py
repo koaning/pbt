@@ -107,7 +107,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Process events with partitioning")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview without writing"
+    )
     parser.add_argument(
         "--full-refresh", action="store_true", help="Force full refresh"
     )
@@ -133,7 +135,11 @@ if __name__ == "__main__":
         print("PARTITIONS CREATED")
         print("=" * 60)
 
-        for table_name in ["events_by_date", "events_incremental", "events_by_user_date"]:
+        for table_name in [
+            "events_by_date",
+            "events_incremental",
+            "events_by_user_date",
+        ]:
             if args.target and args.target != table_name:
                 continue
             partitions = partitioned_sink.list_partitions(table_name)
@@ -155,6 +161,7 @@ if __name__ == "__main__":
 
         print("\nFilter to specific date (partition pruning):")
         from datetime import date
+
         df_filtered = partitioned_sink.read(
             "events_by_date", partition_filter={"date": date(2025, 1, 15)}
         ).collect()
