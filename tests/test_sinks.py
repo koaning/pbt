@@ -86,9 +86,12 @@ PARTITION_MODE_CASES = [
     pytest.param("overwrite", 2, {3, 4}, id="overwrite_replaces"),
 ]
 
-# Append workflow cases for sink-level partition tests
-APPEND_WORKFLOW_CASES = [
+# Workflow cases for sink-level partition tests (append + overwrite)
+# Each case: (initial_df, new_df, partition_by, expected_partitions_after_append,
+#             overwrite_filter, expected_overwrite_values)
+WORKFLOW_CASES = [
     pytest.param(
+        # initial data
         pl.DataFrame({
             "id": [1, 2, 3],
             "date": [
@@ -96,15 +99,18 @@ APPEND_WORKFLOW_CASES = [
                 datetime.date(2025, 1, 15),
                 datetime.date(2025, 1, 16),
             ],
-            "value": ["a", "b", "c"],
+            "value": [10, 20, 30],
         }),
+        # new data (overlaps on 2025-01-16, adds 2025-01-17)
         pl.DataFrame({
             "id": [4, 5],
             "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 17)],
-            "value": ["d", "e"],
+            "value": [400, 500],
         }),
         ["date"],
-        3,
+        3,  # expected partitions after append
+        {"date": datetime.date(2025, 1, 16)},  # filter for overwrite test
+        {400},  # expected values after overwrite (only new data in that partition)
         id="date_partition",
     ),
     pytest.param(
@@ -112,75 +118,36 @@ APPEND_WORKFLOW_CASES = [
             "id": [1, 2, 3],
             "year": [2024, 2024, 2025],
             "month": [12, 12, 1],
-            "value": ["a", "b", "c"],
+            "value": [10, 20, 30],
         }),
         pl.DataFrame({
             "id": [4, 5],
             "year": [2025, 2025],
             "month": [1, 2],
-            "value": ["d", "e"],
+            "value": [400, 500],
         }),
         ["year", "month"],
         3,
+        {"year": 2025, "month": 1},
+        {400},
         id="year_month_partition",
     ),
     pytest.param(
         pl.DataFrame({
             "id": [1, 2, 3],
             "category": ["users", "users", "orders"],
-            "value": ["a", "b", "c"],
+            "value": [10, 20, 30],
         }),
         pl.DataFrame({
             "id": [4, 5],
             "category": ["orders", "products"],
-            "value": ["d", "e"],
+            "value": [400, 500],
         }),
         ["category"],
         3,
+        {"category": "orders"},
+        {400},
         id="string_partition",
-    ),
-]
-
-# Overwrite workflow cases for sink-level partition tests
-OVERWRITE_WORKFLOW_CASES = [
-    pytest.param(
-        pl.DataFrame({
-            "id": [1, 2, 3, 4],
-            "date": [
-                datetime.date(2025, 1, 15),
-                datetime.date(2025, 1, 15),
-                datetime.date(2025, 1, 16),
-                datetime.date(2025, 1, 16),
-            ],
-            "value": [10, 20, 30, 40],
-        }),
-        pl.DataFrame({
-            "id": [3, 4],
-            "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 16)],
-            "value": [300, 400],
-        }),
-        ["date"],
-        {"date": datetime.date(2025, 1, 16)},
-        {300, 400},
-        id="date_partition_overwrite",
-    ),
-    pytest.param(
-        pl.DataFrame({
-            "id": [1, 2, 3, 4],
-            "year": [2024, 2024, 2025, 2025],
-            "month": [12, 12, 1, 1],
-            "value": [10, 20, 30, 40],
-        }),
-        pl.DataFrame({
-            "id": [3, 4],
-            "year": [2025, 2025],
-            "month": [1, 1],
-            "value": [300, 400],
-        }),
-        ["year", "month"],
-        {"year": 2025, "month": 1},
-        {300, 400},
-        id="year_month_partition_overwrite",
     ),
 ]
 
@@ -274,7 +241,8 @@ def test_partition_modes(sink: Sink, mode: str, expected_rows: int, expected_ids
 
 
 @pytest.mark.parametrize(
-    "initial_df,new_df,partition_by,expected_partitions", APPEND_WORKFLOW_CASES
+    "initial_df,new_df,partition_by,expected_partitions,_filter,_expected_values",
+    WORKFLOW_CASES,
 )
 def test_append_workflow(
     sink: Sink,
@@ -282,6 +250,8 @@ def test_append_workflow(
     new_df: pl.DataFrame,
     partition_by: list[str],
     expected_partitions: int,
+    _filter: dict,
+    _expected_values: set,
 ):
     """Test sink-level append workflow with various partition types."""
     initial_rows = len(initial_df)
@@ -302,21 +272,22 @@ def test_append_workflow(
 
 
 @pytest.mark.parametrize(
-    "initial_df,overwrite_df,partition_by,filter_dict,expected_values",
-    OVERWRITE_WORKFLOW_CASES,
+    "initial_df,new_df,partition_by,_expected_partitions,filter_dict,expected_values",
+    WORKFLOW_CASES,
 )
 def test_overwrite_workflow(
     sink: Sink,
     initial_df: pl.DataFrame,
-    overwrite_df: pl.DataFrame,
+    new_df: pl.DataFrame,
     partition_by: list[str],
+    _expected_partitions: int,
     filter_dict: dict,
     expected_values: set,
 ):
     """Test sink-level overwrite workflow with various partition types."""
     sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
     sink.write(
-        overwrite_df, "events", partition_by=partition_by, partition_mode="overwrite"
+        new_df, "events", partition_by=partition_by, partition_mode="overwrite"
     )
 
     overwritten = sink.read("events", partition_filter=filter_dict).collect()
