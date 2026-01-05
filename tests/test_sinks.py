@@ -159,6 +159,114 @@ def test_partition_modes(sink: Sink, mode: str, expected_rows: int, expected_ids
 
 
 # =============================================================================
+# Incremental table simulation tests
+# =============================================================================
+
+
+def test_incremental_table_workflow(sink: Sink):
+    """
+    Simulate incremental table workflow: initial write + incremental append.
+
+    This tests the pattern used by incremental_table decorator:
+    1. Write initial data partitioned by date
+    2. Append new data to existing and new partitions
+    3. Verify no duplicates and correct partition counts
+    """
+    from datetime import datetime as dt
+
+    # Initial data: 3 rows across 2 dates
+    initial = pl.DataFrame({
+        "id": [1, 2, 3],
+        "timestamp": [
+            dt(2025, 1, 15, 10, 0),
+            dt(2025, 1, 15, 11, 0),
+            dt(2025, 1, 16, 10, 0),
+        ],
+        "value": ["a", "b", "c"],
+    }).with_columns(pl.col("timestamp").dt.date().alias("date"))
+
+    sink.write(initial, "events", partition_by=["date"], partition_mode="append")
+
+    # Verify initial state
+    result1 = sink.read("events").collect()
+    assert len(result1) == 3
+    assert len(sink.list_partitions("events")) == 2
+
+    # New data: 2 rows - one existing date, one new date
+    new_data = pl.DataFrame({
+        "id": [4, 5],
+        "timestamp": [
+            dt(2025, 1, 16, 12, 0),  # Same date as id=3
+            dt(2025, 1, 17, 10, 0),  # New date
+        ],
+        "value": ["d", "e"],
+    }).with_columns(pl.col("timestamp").dt.date().alias("date"))
+
+    sink.write(new_data, "events", partition_by=["date"], partition_mode="append")
+
+    # Verify final state
+    result2 = sink.read("events").collect()
+    assert len(result2) == 5, f"Expected 5 rows, got {len(result2)}"
+    assert len(sink.list_partitions("events")) == 3
+
+    # Verify per-partition counts
+    for partition_date, expected_count in [
+        (datetime.date(2025, 1, 15), 2),
+        (datetime.date(2025, 1, 16), 2),
+        (datetime.date(2025, 1, 17), 1),
+    ]:
+        partition_data = sink.read(
+            "events", partition_filter={"date": partition_date}
+        ).collect()
+        assert len(partition_data) == expected_count
+
+
+def test_incremental_with_lookback_overwrite(sink: Sink):
+    """
+    Simulate lookback behavior: overwrite partitions within lookback window.
+
+    When lookback is set, incremental tables use overwrite mode for
+    partitions that fall within the lookback window.
+    """
+    # Initial data
+    initial = pl.DataFrame({
+        "id": [1, 2, 3, 4],
+        "date": [
+            datetime.date(2025, 1, 15),
+            datetime.date(2025, 1, 15),
+            datetime.date(2025, 1, 16),
+            datetime.date(2025, 1, 16),
+        ],
+        "value": [10, 20, 30, 40],
+    })
+    sink.write(initial, "events", partition_by=["date"], partition_mode="append")
+
+    # Lookback reprocess: overwrite 2025-01-16 partition with corrected data
+    corrected = pl.DataFrame({
+        "id": [3, 4],
+        "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 16)],
+        "value": [300, 400],  # Corrected values
+    })
+    sink.write(corrected, "events", partition_by=["date"], partition_mode="overwrite")
+
+    # Verify: 2025-01-15 unchanged, 2025-01-16 replaced
+    result = sink.read("events").collect()
+    assert len(result) == 4
+
+    jan15 = sink.read(
+        "events", partition_filter={"date": datetime.date(2025, 1, 15)}
+    ).collect()
+    assert len(jan15) == 2
+    assert set(jan15["value"].to_list()) == {10, 20}
+
+    jan16 = sink.read(
+        "events", partition_filter={"date": datetime.date(2025, 1, 16)}
+    ).collect()
+    assert len(jan16) == 2
+    assert set(jan16["value"].to_list()) == {300, 400}
+
+
+# =============================================================================
 # Core functionality tests
 # =============================================================================
 
