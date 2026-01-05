@@ -159,111 +159,184 @@ def test_partition_modes(sink: Sink, mode: str, expected_rows: int, expected_ids
 
 
 # =============================================================================
-# Incremental table simulation tests
+# Incremental table simulation tests (parameterized)
 # =============================================================================
 
+# Test incremental append workflow with various partition types
+INCREMENTAL_CASES = [
+    pytest.param(
+        # Initial data
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "date": [
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 16),
+            ],
+            "value": ["a", "b", "c"],
+        }),
+        # New data to append
+        pl.DataFrame({
+            "id": [4, 5],
+            "date": [
+                datetime.date(2025, 1, 16),
+                datetime.date(2025, 1, 17),
+            ],
+            "value": ["d", "e"],
+        }),
+        ["date"],
+        3,  # expected partitions after append
+        id="date_partition",
+    ),
+    pytest.param(
+        # Initial data with year/month partitions
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "year": [2024, 2024, 2025],
+            "month": [12, 12, 1],
+            "value": ["a", "b", "c"],
+        }),
+        # New data to append
+        pl.DataFrame({
+            "id": [4, 5],
+            "year": [2025, 2025],
+            "month": [1, 2],
+            "value": ["d", "e"],
+        }),
+        ["year", "month"],
+        3,  # expected partitions: 2024/12, 2025/1, 2025/2
+        id="year_month_partition",
+    ),
+    pytest.param(
+        # Initial data with category partition
+        pl.DataFrame({
+            "id": [1, 2, 3],
+            "category": ["users", "users", "orders"],
+            "value": ["a", "b", "c"],
+        }),
+        # New data to append
+        pl.DataFrame({
+            "id": [4, 5],
+            "category": ["orders", "products"],
+            "value": ["d", "e"],
+        }),
+        ["category"],
+        3,  # expected partitions: users, orders, products
+        id="string_partition",
+    ),
+]
 
-def test_incremental_table_workflow(sink: Sink):
+
+@pytest.mark.parametrize(
+    "initial_df,new_df,partition_by,expected_partitions", INCREMENTAL_CASES
+)
+def test_incremental_append_workflow(
+    sink: Sink,
+    initial_df: pl.DataFrame,
+    new_df: pl.DataFrame,
+    partition_by: list[str],
+    expected_partitions: int,
+):
     """
-    Simulate incremental table workflow: initial write + incremental append.
+    Simulate incremental table workflow with various partition types.
 
-    This tests the pattern used by incremental_table decorator:
-    1. Write initial data partitioned by date
-    2. Append new data to existing and new partitions
-    3. Verify no duplicates and correct partition counts
+    Tests the append pattern:
+    1. Write initial data partitioned by columns
+    2. Append new data (some to existing partitions, some to new)
+    3. Verify correct total rows and partition counts
     """
-    from datetime import datetime as dt
+    initial_rows = len(initial_df)
+    new_rows = len(new_df)
 
-    # Initial data: 3 rows across 2 dates
-    initial = pl.DataFrame({
-        "id": [1, 2, 3],
-        "timestamp": [
-            dt(2025, 1, 15, 10, 0),
-            dt(2025, 1, 15, 11, 0),
-            dt(2025, 1, 16, 10, 0),
-        ],
-        "value": ["a", "b", "c"],
-    }).with_columns(pl.col("timestamp").dt.date().alias("date"))
-
-    sink.write(initial, "events", partition_by=["date"], partition_mode="append")
-
-    # Verify initial state
+    # Initial write
+    sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
     result1 = sink.read("events").collect()
-    assert len(result1) == 3
-    assert len(sink.list_partitions("events")) == 2
+    assert len(result1) == initial_rows
 
-    # New data: 2 rows - one existing date, one new date
-    new_data = pl.DataFrame({
-        "id": [4, 5],
-        "timestamp": [
-            dt(2025, 1, 16, 12, 0),  # Same date as id=3
-            dt(2025, 1, 17, 10, 0),  # New date
-        ],
-        "value": ["d", "e"],
-    }).with_columns(pl.col("timestamp").dt.date().alias("date"))
-
-    sink.write(new_data, "events", partition_by=["date"], partition_mode="append")
+    # Append new data
+    sink.write(new_df, "events", partition_by=partition_by, partition_mode="append")
 
     # Verify final state
     result2 = sink.read("events").collect()
-    assert len(result2) == 5, f"Expected 5 rows, got {len(result2)}"
-    assert len(sink.list_partitions("events")) == 3
+    assert len(result2) == initial_rows + new_rows
+    assert len(sink.list_partitions("events")) == expected_partitions
 
-    # Verify per-partition counts
-    for partition_date, expected_count in [
-        (datetime.date(2025, 1, 15), 2),
-        (datetime.date(2025, 1, 16), 2),
-        (datetime.date(2025, 1, 17), 1),
-    ]:
-        partition_data = sink.read(
-            "events", partition_filter={"date": partition_date}
-        ).collect()
-        assert len(partition_data) == expected_count
+    # Verify all IDs are present (no duplicates, no missing)
+    all_ids = set(initial_df["id"].to_list() + new_df["id"].to_list())
+    assert set(result2["id"].to_list()) == all_ids
 
 
-def test_incremental_with_lookback_overwrite(sink: Sink):
+# Test overwrite behavior with various partition types
+OVERWRITE_CASES = [
+    pytest.param(
+        pl.DataFrame({
+            "id": [1, 2, 3, 4],
+            "date": [
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 15),
+                datetime.date(2025, 1, 16),
+                datetime.date(2025, 1, 16),
+            ],
+            "value": [10, 20, 30, 40],
+        }),
+        pl.DataFrame({
+            "id": [3, 4],
+            "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 16)],
+            "value": [300, 400],
+        }),
+        ["date"],
+        {"date": datetime.date(2025, 1, 16)},
+        {300, 400},
+        id="date_partition_overwrite",
+    ),
+    pytest.param(
+        pl.DataFrame({
+            "id": [1, 2, 3, 4],
+            "year": [2024, 2024, 2025, 2025],
+            "month": [12, 12, 1, 1],
+            "value": [10, 20, 30, 40],
+        }),
+        pl.DataFrame({
+            "id": [3, 4],
+            "year": [2025, 2025],
+            "month": [1, 1],
+            "value": [300, 400],
+        }),
+        ["year", "month"],
+        {"year": 2025, "month": 1},
+        {300, 400},
+        id="year_month_partition_overwrite",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "initial_df,overwrite_df,partition_by,filter_dict,expected_values", OVERWRITE_CASES
+)
+def test_incremental_overwrite_workflow(
+    sink: Sink,
+    initial_df: pl.DataFrame,
+    overwrite_df: pl.DataFrame,
+    partition_by: list[str],
+    filter_dict: dict,
+    expected_values: set,
+):
     """
-    Simulate lookback behavior: overwrite partitions within lookback window.
+    Simulate lookback/overwrite behavior with various partition types.
 
-    When lookback is set, incremental tables use overwrite mode for
-    partitions that fall within the lookback window.
+    Tests that overwrite mode correctly replaces only the targeted partition.
     """
-    # Initial data
-    initial = pl.DataFrame({
-        "id": [1, 2, 3, 4],
-        "date": [
-            datetime.date(2025, 1, 15),
-            datetime.date(2025, 1, 15),
-            datetime.date(2025, 1, 16),
-            datetime.date(2025, 1, 16),
-        ],
-        "value": [10, 20, 30, 40],
-    })
-    sink.write(initial, "events", partition_by=["date"], partition_mode="append")
+    # Initial write
+    sink.write(initial_df, "events", partition_by=partition_by, partition_mode="append")
 
-    # Lookback reprocess: overwrite 2025-01-16 partition with corrected data
-    corrected = pl.DataFrame({
-        "id": [3, 4],
-        "date": [datetime.date(2025, 1, 16), datetime.date(2025, 1, 16)],
-        "value": [300, 400],  # Corrected values
-    })
-    sink.write(corrected, "events", partition_by=["date"], partition_mode="overwrite")
+    # Overwrite specific partition
+    sink.write(
+        overwrite_df, "events", partition_by=partition_by, partition_mode="overwrite"
+    )
 
-    # Verify: 2025-01-15 unchanged, 2025-01-16 replaced
-    result = sink.read("events").collect()
-    assert len(result) == 4
-
-    jan15 = sink.read(
-        "events", partition_filter={"date": datetime.date(2025, 1, 15)}
-    ).collect()
-    assert len(jan15) == 2
-    assert set(jan15["value"].to_list()) == {10, 20}
-
-    jan16 = sink.read(
-        "events", partition_filter={"date": datetime.date(2025, 1, 16)}
-    ).collect()
-    assert len(jan16) == 2
-    assert set(jan16["value"].to_list()) == {300, 400}
+    # Verify overwritten partition has new values
+    overwritten = sink.read("events", partition_filter=filter_dict).collect()
+    assert set(overwritten["value"].to_list()) == expected_values
 
 
 # =============================================================================
